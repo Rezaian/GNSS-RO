@@ -27,9 +27,10 @@ jobs:
       - name: Build macOS app
         run: |
           pyinstaller \
-            --onefile \
+            --onedir \
             --windowed \
             --name "GNSS-RO" \
+            --osx-bundle-identifier "com.gnssro.app" \
             --add-data "login_ui.py:." \
             --add-data "ground_gnss_ro_pipeline.py:." \
             --add-data "sat_gnss_ro_pipeline.py:." \
@@ -39,11 +40,16 @@ jobs:
             --hidden-import "matplotlib.backends.backend_qtagg" \
             gnss_ro_gui.py
 
+      - name: Sign and zip macOS app
+        run: |
+          codesign --force --deep --sign - "dist/GNSS-RO.app"
+          cd dist && zip -r GNSS-RO-macOS.zip GNSS-RO.app
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: GNSS-RO-macOS
-          path: dist/GNSS-RO.app
+          path: dist/GNSS-RO-macOS.zip
           retention-days: 30
 
   build-windows:
@@ -106,7 +112,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            macos/GNSS-RO.app
+            macos/GNSS-RO-macOS.zip
             windows/GNSS-RO.exe
           draft: false
           prerelease: false
