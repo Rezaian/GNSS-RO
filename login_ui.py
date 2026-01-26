@@ -6,14 +6,14 @@ Professional login dialog with configurable logo and background.
 
 import os
 import sys
-from PyQt6.QtWidgets import (
+
+from qt_compat import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QWidget, QGraphicsDropShadowEffect, QApplication
+    QPushButton, QWidget, QGraphicsDropShadowEffect, QApplication,
+    Qt, QPropertyAnimation, QEasingCurve, QPoint, QTimer,
+    QPixmap, QFont, QColor, QPainter, QLinearGradient, QBrush,
+    exec_app
 )
-from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QPoint, QTimer
-from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QLinearGradient, QBrush
-
-
 # ============================================================================
 # RESOURCE PATH HELPER (PyInstaller compatible)
 # ============================================================================
@@ -339,5 +339,5 @@ class LoginDialog(QDialog):
     def authenticate(app: QApplication) -> bool:
         """Static method to run login flow. Returns True if authenticated."""
         dialog = LoginDialog()
-        result = dialog.exec()
+        result = dialog.exec_app()
         return result == QDialog.DialogCode.Accepted

@@ -33,6 +33,7 @@ jobs:
             --osx-bundle-identifier "com.gnssro.app" \
             --add-data "assets:assets" \
             --add-data "login_ui.py:." \
+            --add-data "qt_compat.py:." \
             --add-data "ground_gnss_ro_pipeline.py:." \
             --add-data "sat_gnss_ro_pipeline.py:." \
             --add-data "rinex_parser.py:." \
@@ -87,6 +88,7 @@ jobs:
             --name "GNSS-RO" `
             --add-data "assets;assets" `
             --add-data "login_ui.py;." `
+            --add-data "qt_compat.py;." `
             --add-data "ground_gnss_ro_pipeline.py;." `
             --add-data "sat_gnss_ro_pipeline.py;." `
             --add-data "rinex_parser.py;." `

@@ -20,14 +20,12 @@ import glob
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
-from PyQt6.QtWidgets import (
+from qt_compat import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
     QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
-    QSplitter, QMessageBox
+    QSplitter, QMessageBox, Qt, QTimer, QColor, QFont
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QFont
 
 import pandas as pd
 import numpy as np
@@ -1411,7 +1409,7 @@ def main():
     
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec_app())
 
 
 if __name__ == '__main__':
