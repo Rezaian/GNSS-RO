@@ -63,13 +63,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.8'
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install pyinstaller
-          pip install pyqt6 pandas numpy matplotlib scipy netCDF4 xarray
+          pip install pyqt5 pandas numpy matplotlib scipy netCDF4 xarray
 
       - name: Build Windows exe
         run: |
@@ -82,10 +82,10 @@ jobs:
             --add-data "ground_gnss_ro_pipeline.py;." `
             --add-data "sat_gnss_ro_pipeline.py;." `
             --add-data "rinex_parser.py;." `
-            --hidden-import "PyQt6.QtWidgets" `
-            --hidden-import "PyQt6.QtCore" `
-            --hidden-import "PyQt6.QtGui" `
-            --hidden-import "matplotlib.backends.backend_qtagg" `
+            --hidden-import "PyQt5.QtWidgets" `
+            --hidden-import "PyQt5.QtCore" `
+            --hidden-import "PyQt5.QtGui" `
+            --hidden-import "matplotlib.backends.backend_qt5agg" `
             gnss_ro_gui.py
 
       - name: Upload Windows artifact
