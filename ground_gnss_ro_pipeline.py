@@ -1282,7 +1282,7 @@ class SP3Parser:
             vel_z = np.float64(cs_z.derivative()(target_timestamp_gps))
 
             return {
-                'gps_time_used': target_time_gps,  # Log the converted time
+                'gps_time_used': target_time_gps.strftime('%Y-%m-%d %H:%M:%S.%f'),
                 'interp_x': interp_x,
                 'interp_y': interp_y,
                 'interp_z': interp_z,
