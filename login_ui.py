@@ -339,5 +339,5 @@ class LoginDialog(QDialog):
     def authenticate(app: QApplication) -> bool:
         """Static method to run login flow. Returns True if authenticated."""
         dialog = LoginDialog()
-        result = dialog.exec_app()
+        result = exec_app(dialog)
         return result == QDialog.DialogCode.Accepted

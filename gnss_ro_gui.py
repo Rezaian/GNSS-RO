@@ -1409,7 +1409,7 @@ def main():
     
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_app())
+    sys.exit(exec_app(app))
 
 
 if __name__ == '__main__':
