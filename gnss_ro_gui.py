@@ -24,7 +24,8 @@ from qt_compat import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
     QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
-    QSplitter, QMessageBox, Qt, QTimer, QColor, QFont
+    QSplitter, QMessageBox, Qt, QTimer, QColor, QFont,
+    exec_app
 )
 
 import pandas as pd
