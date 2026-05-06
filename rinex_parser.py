@@ -132,6 +132,43 @@ SIGNAL_NAMES = {
 VALID_OBS_PREFIXES = {'C', 'L', 'D', 'S'}
 
 
+def ecef_to_geodetic(x, y, z):
+    """
+    Convert ECEF (X, Y, Z) in meters to geodetic (lat_deg, lon_deg, alt_m).
+    Bowring iterative method on WGS84 ellipsoid.
+    """
+    import math
+    a = 6378137.0          # WGS84 semi-major axis
+    f = 1 / 298.257223563  # flattening
+    b = a * (1 - f)        # semi-minor axis
+    e2 = 1 - (b / a) ** 2  # first eccentricity squared
+    ep2 = (a / b) ** 2 - 1  # second eccentricity squared
+    
+    lon = math.atan2(y, x)
+    p = math.sqrt(x ** 2 + y ** 2)
+    
+    # Initial estimate using Bowring's method
+    theta = math.atan2(z * a, p * b)
+    lat = math.atan2(
+        z + ep2 * b * math.sin(theta) ** 3,
+        p - e2 * a * math.cos(theta) ** 3
+    )
+    
+    # Iterate for convergence
+    for _ in range(10):
+        N = a / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+        lat_new = math.atan2(z + e2 * N * math.sin(lat), p)
+        if abs(lat_new - lat) < 1e-12:
+            lat = lat_new
+            break
+        lat = lat_new
+    
+    N = a / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+    alt = p / math.cos(lat) - N if abs(math.cos(lat)) > 1e-10 else abs(z) - b
+    
+    return math.degrees(lat), math.degrees(lon), alt
+
+
 class RINEXParser:
     def __init__(self, filepath):
         self.filepath = Path(filepath)
@@ -144,6 +181,7 @@ class RINEXParser:
         self.first_obs_time = None
         self.last_obs_time = None
         self.approx_position = None  # (X, Y, Z) in meters
+        self.marker_name = None  # Station marker name
         self.antenna_delta = None  # (H, E, N) in meters
         self.leap_seconds = None
         self.glonass_slots = {}  # {slot: freq_num}
@@ -175,6 +213,11 @@ class RINEXParser:
                     )
                 except (ValueError, IndexError):
                     pass
+
+            elif label == 'MARKER NAME':
+                name = line[0:60].strip()
+                if name:
+                    self.marker_name = name
                     
             elif label == 'ANTENNA: DELTA H/E/N':
                 try:
@@ -321,6 +364,42 @@ class RINEXParser:
                 
             i += 1
                 
+    def get_station_geodetic(self):
+        """
+        Return station position as geodetic (lat, lon, alt) from APPROX POSITION XYZ.
+        Returns dict with keys: latitude, longitude, altitude, ecef_x, ecef_y, ecef_z, marker_name
+        or None if APPROX POSITION XYZ is not available or is (0,0,0).
+        """
+        if self.approx_position is None:
+            return None
+        x, y, z = self.approx_position
+        # Skip if position is (0, 0, 0) — means not set
+        if abs(x) < 1.0 and abs(y) < 1.0 and abs(z) < 1.0:
+            return None
+        lat, lon, alt = ecef_to_geodetic(x, y, z)
+        return {
+            'latitude': lat,
+            'longitude': lon,
+            'altitude': alt,
+            'ecef_x': x,
+            'ecef_y': y,
+            'ecef_z': z,
+            'marker_name': self.marker_name or 'Unknown'
+        }
+
+    def parse_header_only(self):
+        """
+        Parse only the RINEX header (fast - doesn't read observations).
+        Useful for extracting station position without full file parsing.
+        """
+        with open(self.filepath, 'r', errors='replace') as f:
+            lines = []
+            for line in f:
+                lines.append(line.rstrip('\n'))
+                if 'END OF HEADER' in line:
+                    break
+        self.parse_header(lines)
+
     def parse_observation_value(self, obs_str):
         """Parse a single observation value (14.3 format with optional LLI and SSI).
         

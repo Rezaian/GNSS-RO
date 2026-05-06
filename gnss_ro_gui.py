@@ -34,6 +34,7 @@ import numpy as np
 from ground_gnss_ro_pipeline import (
     StationConfig, PipelineConfig as GroundPipelineConfig, ProcessingResult,
     evaluate_ro_status, generate_raw_plots, generate_derived_plots,
+    generate_atmospheric_plots,
     parse_gnss_directory, match_observations_with_sp3,
     calculate_accurate_elevations, calculate_geometric_doppler,
     apply_single_differencing, retrieve_bending_angles,
@@ -47,6 +48,7 @@ from sat_gnss_ro_pipeline import (
 import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
 import multiprocessing as mp
@@ -114,11 +116,13 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
     # Ground requires: (UBX or RNX) + SP3 + metadata
     has_obs_files = ubx_files or rnx_files
     
-    if has_obs_files and sp3_files and metadata_files:
+    # Ground requires: (UBX or RNX) + SP3 + optionally metadata.cra
+    # metadata.cra is optional if RINEX files contain APPROX POSITION XYZ
+    if has_obs_files and sp3_files:
         has_ground = True
         result['ubx_dir'] = directory
         result['sp3_file'] = sp3_files[0]
-        result['metadata_file'] = metadata_files[0]
+        result['metadata_file'] = metadata_files[0] if metadata_files else None
         
         # Determine observation source
         if ubx_files:
@@ -131,6 +135,9 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
         # If both exist, note UBX will be preferred
         if ubx_files and rnx_files:
             result['info'].append(f"Note: {len(rnx_files)} RINEX files also found (UBX preferred)")
+        
+        if not metadata_files:
+            result['info'].append("No metadata.cra — will read station position from RINEX header")
         
         if len(sp3_files) > 1:
             result['warnings'].append(f"Multiple SP3 files — using {os.path.basename(sp3_files[0])}")
@@ -181,7 +188,7 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
         result['valid'] = True
     else:
         result['errors'].append("No valid GNSS-RO data found")
-        result['errors'].append("Ground requires: (.ubx OR .rnx) + .sp3 + metadata.cra")
+        result['errors'].append("Ground requires: (.ubx OR .rnx) + .sp3 (metadata.cra optional if RINEX has station position)")
         result['errors'].append("Satellite requires: conPhs_* files")
     
     return result
@@ -216,6 +223,7 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
     from ground_gnss_ro_pipeline import (
         StationConfig, PipelineConfig, ProcessingResult, SP3Parser,
         evaluate_ro_status, generate_raw_plots, generate_derived_plots,
+        generate_atmospheric_plots,
         parse_gnss_directory, calculate_accurate_elevations,
         calculate_geometric_doppler, apply_single_differencing,
         retrieve_bending_angles, retrieve_refractivity,
@@ -397,7 +405,11 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
                         'atm_csv': os.path.join(output_dir, 'atmospheric', f'{sat_id}_atmospheric.csv'),
                     }
                     derived_path = os.path.join(plots_dir, f'{sat_id}_derived.png')
-                    generate_derived_plots(sat_results, sat_id, derived_path)
+                    generate_derived_plots(sat_results, sat_id, derived_path,
+                                           station_altitude=station.altitude)
+                    
+                    atm_path = os.path.join(plots_dir, f'{sat_id}_atmospheric.png')
+                    generate_atmospheric_plots(sat_results, sat_id, atm_path)
         
         write_log()
         
@@ -569,10 +581,12 @@ def run_satellite_pipeline(conphs_dir: str, output_dir: str, progress_queue: Que
 # ============================================================================
 
 class PlotCanvas(FigureCanvas):
+    """Interactive plot canvas with zoom, pan, and reset support."""
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(10, 8), dpi=100, facecolor='#FAFAFA')
         super().__init__(self.fig)
         self.setParent(parent)
+        self._is_placeholder = True
     
     def show_placeholder(self, message: str = "Select an item"):
         self.fig.clear()
@@ -580,6 +594,7 @@ class PlotCanvas(FigureCanvas):
         ax.text(0.5, 0.5, message, ha='center', va='center',
                 fontsize=13, color='#757575', transform=ax.transAxes)
         ax.axis('off')
+        self._is_placeholder = True
         self.draw()
     
     def load_from_png(self, png_path: str):
@@ -590,12 +605,47 @@ class PlotCanvas(FigureCanvas):
             ax.imshow(img)
             ax.axis('off')
             self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            self._is_placeholder = False
         else:
             ax = self.fig.add_subplot(111)
             ax.text(0.5, 0.5, "Plot not available", ha='center', va='center',
                     fontsize=13, color='#757575', transform=ax.transAxes)
             ax.axis('off')
+            self._is_placeholder = True
         self.draw()
+
+
+class InteractivePlotWidget(QWidget):
+    """Wrapper that pairs a PlotCanvas with a navigation toolbar for
+    zoom, pan, home (reset), and save-to-file functionality."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.canvas = PlotCanvas(self)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar.setStyleSheet("""
+            QToolBar {
+                spacing: 6px;
+                padding: 2px 4px;
+                background: #F5F5F5;
+                border-bottom: 1px solid #CCCCCC;
+            }
+        """)
+
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas, 1)
+
+    # Delegate convenience methods so the rest of the code can call them
+    # the same way it called them on the old PlotCanvas.
+    def show_placeholder(self, message: str = "Select an item"):
+        self.canvas.show_placeholder(message)
+
+    def load_from_png(self, png_path: str):
+        self.canvas.load_from_png(png_path)
 
 
 # ============================================================================
@@ -648,6 +698,23 @@ class StationInfoPanel(QGroupBox):
         self.lon_edit.setText(str(metadata.get('STATION_LON', '')))
         self.alt_edit.setText(str(metadata.get('STATION_HEIGHT', '')))
     
+    def load_from_rinex_station(self, station_info: Dict):
+        """Load station position from RINEX header info dict."""
+        self.name_edit.setText(str(station_info.get('marker_name', 'RINEX Station')))
+        self.lat_edit.setText(f"{station_info['latitude']:.6f}")
+        self.lon_edit.setText(f"{station_info['longitude']:.6f}")
+        self.alt_edit.setText(f"{station_info['altitude']:.1f}")
+    
+    def has_valid_coords(self) -> bool:
+        """Check if station coordinates are filled in and valid."""
+        try:
+            float(self.lat_edit.text())
+            float(self.lon_edit.text())
+            float(self.alt_edit.text())
+            return True
+        except (ValueError, AttributeError):
+            return False
+    
     def get_station_config(self) -> Optional[StationConfig]:
         try:
             return StationConfig(
@@ -684,7 +751,7 @@ class ResultListWidget(QListWidget):
         self.setStyleSheet("""
             QListWidget {
                 font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 11px;
+                font-size: 13px;
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
             }
@@ -859,7 +926,7 @@ class ProgressPanel(QGroupBox):
         layout.addWidget(self.progress_bar)
         
         self.detail_label = QLabel("")
-        self.detail_label.setStyleSheet("color: #616161; font-size: 10px;")
+        self.detail_label.setStyleSheet("color: #616161; font-size: 12px;")
         self.detail_label.setWordWrap(True)
         layout.addWidget(self.detail_label)
     
@@ -960,7 +1027,7 @@ class MainWindow(QMainWindow):
         
         self.validation_label = QLabel("")
         self.validation_label.setWordWrap(True)
-        self.validation_label.setStyleSheet("font-size: 10px;")
+        self.validation_label.setStyleSheet("font-size: 12px;")
         input_layout.addWidget(self.validation_label)
         
         sidebar_layout.addWidget(input_group)
@@ -982,7 +1049,7 @@ class MainWindow(QMainWindow):
                 background-color: #1976D2;
                 color: white;
                 font-weight: bold;
-                font-size: 12px;
+                font-size: 14px;
                 border: none;
                 border-radius: 4px;
             }
@@ -999,7 +1066,7 @@ class MainWindow(QMainWindow):
                 background-color: #D32F2F;
                 color: white;
                 font-weight: bold;
-                font-size: 12px;
+                font-size: 14px;
                 border: none;
                 border-radius: 4px;
             }
@@ -1024,7 +1091,7 @@ class MainWindow(QMainWindow):
         result_layout.addWidget(self.result_list)
         
         self.legend_label = QLabel("● Success/RO    ○ Failed/No RO")
-        self.legend_label.setStyleSheet("color: #757575; font-size: 9px;")
+        self.legend_label.setStyleSheet("color: #757575; font-size: 11px;")
         result_layout.addWidget(self.legend_label)
         
         sidebar_layout.addWidget(result_group, 1)
@@ -1044,18 +1111,22 @@ class MainWindow(QMainWindow):
             }
             QTabBar::tab {
                 padding: 8px 16px;
-                font-size: 11px;
+                font-size: 13px;
             }
             QTabBar::tab:selected { font-weight: bold; }
         """)
         
-        self.raw_canvas = PlotCanvas()
+        self.raw_canvas = InteractivePlotWidget()
         self.raw_canvas.show_placeholder("Select an item to view observations")
         self.tab_widget.addTab(self.raw_canvas, "Observations / Raw")
         
-        self.derived_canvas = PlotCanvas()
+        self.derived_canvas = InteractivePlotWidget()
         self.derived_canvas.show_placeholder("Select a successful item to view profiles")
-        self.tab_widget.addTab(self.derived_canvas, "Atmospheric Profiles")
+        self.tab_widget.addTab(self.derived_canvas, "Bending / Refractivity")
+        
+        self.atm_canvas = InteractivePlotWidget()
+        self.atm_canvas.show_placeholder("Select a successful item to view atmospheric profiles")
+        self.tab_widget.addTab(self.atm_canvas, "Atmospheric Profiles")
         
         main_panel_layout.addWidget(self.tab_widget)
         splitter.addWidget(main_panel)
@@ -1117,8 +1188,33 @@ class MainWindow(QMainWindow):
             if metadata:
                 self.station_panel.load_from_metadata(metadata)
         
+        # If station coords still empty (no CRA, or CRA has no coords), try RINEX header
+        if has_ground and not self.station_panel.has_valid_coords():
+            self._try_load_rinex_station_position()
+        
         self.run_btn.setEnabled(self.scan_result['valid'])
     
+    def _try_load_rinex_station_position(self):
+        """Try to read station position from RINEX file headers."""
+        try:
+            from ground_gnss_ro_pipeline import extract_rinex_station_info
+            input_dir = self.scan_result.get('ubx_dir')
+            if not input_dir:
+                return
+            station_info = extract_rinex_station_info(input_dir)
+            if station_info:
+                self.station_panel.load_from_rinex_station(station_info)
+                self.validation_label.setText(
+                    self.validation_label.text() + 
+                    f"<br><span style='color:#1B5E20'>✓ Station position auto-read from RINEX header: "
+                    f"{station_info['latitude']:.4f}°N, {station_info['longitude']:.4f}°E, "
+                    f"{station_info['altitude']:.1f}m ({station_info['marker_name']})</span>"
+                )
+        except Exception as e:
+            self.validation_label.setText(
+                self.validation_label.text() + 
+                f"<br><span style='color:#F57C00'>⚠ Could not read station position from RINEX: {e}</span>"
+            )
 
     def _run_pipeline(self):
         data_type = self.scan_result['data_type']
@@ -1291,6 +1387,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.raw_canvas.show_placeholder("Processing cancelled")
         self.derived_canvas.show_placeholder("Processing cancelled")
+        self.atm_canvas.show_placeholder("Processing cancelled")
     
     def _on_all_pipelines_finished(self):
         # Cleanup
@@ -1320,6 +1417,7 @@ class MainWindow(QMainWindow):
         
         self.raw_canvas.show_placeholder("Select an item to view")
         self.derived_canvas.show_placeholder("Select an item to view profiles")
+        self.atm_canvas.show_placeholder("Select an item to view atmospheric profiles")
         
         # Summary message
         msg_parts = []
@@ -1376,6 +1474,15 @@ class MainWindow(QMainWindow):
                         "• |Atmospheric Doppler| > 2.5 Hz\n"
                         "• Minimum 10 epochs"
                     )
+            elif current_tab == 2:
+                if is_success:
+                    atm_path = os.path.join(plots_dir, f'{item_id}_atmospheric.png')
+                    self.atm_canvas.load_from_png(atm_path)
+                else:
+                    self.atm_canvas.show_placeholder(
+                        f"No radio occultation detected for {item_id}\n\n"
+                        "Atmospheric retrieval requires successful RO processing."
+                    )
         
         elif item_type == 'satellite':
             event_plots_dir = os.path.join(self.sat_output_dir, item_id, 'plots')
@@ -1392,6 +1499,14 @@ class MainWindow(QMainWindow):
                     self.derived_canvas.show_placeholder(
                         f"Processing failed for event {item_id}"
                     )
+            elif current_tab == 2:
+                if is_success:
+                    atm_path = os.path.join(event_plots_dir, f'{item_id}_panel3_atmospheric.png')
+                    self.atm_canvas.load_from_png(atm_path)
+                else:
+                    self.atm_canvas.show_placeholder(
+                        f"Processing failed for event {item_id}"
+                    )
 
 
 # ============================================================================
@@ -1405,7 +1520,7 @@ def main():
     if not LoginDialog.authenticate(app):
         sys.exit(0)
     
-    font = QFont("Segoe UI", 10)
+    font = QFont("Segoe UI", 12)
     app.setFont(font)
     
     window = MainWindow()
