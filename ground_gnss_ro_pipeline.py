@@ -1,5 +1,5 @@
 """
-GNSS Radio Occultation Processing Pipeline v1.2
+GNSS Radio Occultation Processing Pipeline v3.3.2
 ================================================
 
 Pipeline Steps:
@@ -203,7 +203,7 @@ RO_ELEVATION_THRESHOLD = 5.0
 RO_DOPPLER_THRESHOLD = 1
 RO_MIN_EPOCHS = 10
 
-POLYNOMIAL_WINDOW = 150 #(for a 50Hz sampling be 150/50 = 3)
+POLYNOMIAL_WINDOW = 150 #(seconds, for a 50Hz sampling be 150/50 = 3)
 
 
 def infer_signal_frequency(sig_id: str, gnss_id: str = None) -> Optional[float]:
@@ -361,6 +361,13 @@ class StationConfig:
     longitude: float
     altitude: float
     name: str = "Station"
+    # Surface meteorological data for accurate refractivity.
+    # If provided, N_surface is computed from P, T, e using Smith-Weintraub.
+    # If not provided, falls back to standard atmosphere N=315 * exp(-h/7km).
+    surface_pressure_hPa: Optional[float] = None    # station-level pressure (hPa)
+    surface_temp_K: Optional[float] = None           # station-level temperature (K)
+    surface_humidity_hPa: Optional[float] = None     # water vapor pressure (hPa)
+    surface_N: Optional[float] = None                # direct override: N-units at station
 
     def to_ecef(self) -> np.ndarray:
         return geodetic_to_ecef(self.latitude, self.longitude, self.altitude)
@@ -371,13 +378,38 @@ class StationConfig:
         N = WGS84_A / np.sqrt(1 - WGS84_E2 * np.sin(lat_r) ** 2)
         return np.sqrt(M * N)
 
+    def get_surface_refractivity(self) -> float:
+        """
+        Return surface refractivity in N-units at station level.
+        
+        Priority:
+        1. Direct override (surface_N)
+        2. Smith-Weintraub from met data: N = 77.6·P/T + 3.73e5·e/T²
+        3. Standard atmosphere fallback: N = 315·exp(-h/7km)
+        """
+        if self.surface_N is not None:
+            return self.surface_N
+        if (self.surface_pressure_hPa is not None and 
+            self.surface_temp_K is not None and
+            self.surface_humidity_hPa is not None):
+            P = self.surface_pressure_hPa
+            T = self.surface_temp_K
+            e = self.surface_humidity_hPa
+            return 77.6 * P / T + 3.73e5 * e / T**2
+        # Fallback: standard atmosphere
+        return 315.0 * np.exp(-self.altitude / 7000.0)
+
 
 @dataclass
 class PipelineConfig:
     elevation_mask_high: float = 45.0
     elevation_mask_low: float = -5.0
-    height_range_min: float = -10.0
-    height_range_max: float = 150.0
+    height_range_min: float = -1.0
+    height_range_max: float = -1.0  # Sentinel: computed dynamically from Bouguer bound
+    # For ground-based RO, the maximum physical impact height is:
+    #   h_max = (n_r - 1)*R_c + n_r*h_station ≈ h_station + 2 km
+    # Set to -1 to auto-compute from station altitude (recommended).
+    # Override with a positive value to use a fixed upper bound (km).
     climatology_blend_height: float = 50.0
     min_epochs_for_bending: int = 10
     bending_angle_threshold: float = 1e-6
@@ -672,6 +704,34 @@ def parse_ubx_directory(
         result.data.to_csv(output_csv, index=False)
     return result
 
+
+def extract_rinex_station_info(input_dir: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract station position from the first valid RINEX file header in directory.
+    Returns dict with keys: latitude, longitude, altitude, ecef_x, ecef_y, ecef_z, marker_name
+    or None if no valid station position found.
+    """
+    from rinex_parser import RINEXParser
+    
+    rnx_patterns = ['*.rnx', '*.RNX', '*.[0-9][0-9]o', '*.[0-9][0-9]O',
+                    '*.obs', '*.OBS', '*_MO.rnx', '*_MO.RNX']
+    rnx_files = []
+    for pattern in rnx_patterns:
+        rnx_files.extend(glob.glob(os.path.join(input_dir, pattern)))
+    rnx_files = sorted(set(rnx_files))
+    
+    for rnx_file in rnx_files:
+        try:
+            parser = RINEXParser(rnx_file)
+            parser.parse_header_only()
+            station_info = parser.get_station_geodetic()
+            if station_info is not None:
+                return station_info
+        except Exception:
+            continue
+    return None
+
+
 def parse_rnx_directory(
     input_dir: str,
     output_csv: Optional[str] = None,
@@ -695,12 +755,17 @@ def parse_rnx_directory(
         return ProcessingResult(False, message=f"No RINEX files in {input_dir}")
     
     all_observations = []
+    station_info = None
     
     for i, rnx_file in enumerate(rnx_files):
         try:
             parser = RINEXParser(rnx_file)
             observations = parser.parse()
             all_observations.extend(observations)
+            
+            # Extract station position from first file that has it
+            if station_info is None:
+                station_info = parser.get_station_geodetic()
             
             if progress_callback:
                 progress_callback(f"Parsing RNX {i+1}/{len(rnx_files)}", (i+1)/len(rnx_files) * 0.1)
@@ -740,7 +805,7 @@ def parse_rnx_directory(
         success=True,
         data=df,
         message=f"Parsed {len(rnx_files)} RINEX files, {len(df)} observations",
-        metadata={'file_count': len(rnx_files), 'source': 'RINEX'}
+        metadata={'file_count': len(rnx_files), 'source': 'RINEX', 'rinex_station': station_info}
     )
 
 
@@ -902,7 +967,7 @@ def _compute_doppler_polynomial(
             if i > 0:
                 dt = t_sec[i] - t_sec[i-1]
                 if dt > 0 and dt < max_gap_sec:  # CHANGED: was 1.0
-                    doppler[i] = (phases[i] - phases[i-1]) / dt
+                    doppler[i] = -(phases[i] - phases[i-1]) / dt
             continue
         
         t_window = t_sec[start_idx:end_idx]
@@ -915,7 +980,7 @@ def _compute_doppler_polynomial(
             if i > 0:
                 dt = t_sec[i] - t_sec[i-1]
                 if dt > 0 and dt < max_gap_sec:  # CHANGED: was 1.0
-                    doppler[i] = (phases[i] - phases[i-1]) / dt
+                    doppler[i] = -(phases[i] - phases[i-1]) / dt
             continue
         
         t_center = t_sec[i]
@@ -923,12 +988,12 @@ def _compute_doppler_polynomial(
         
         try:
             coeffs = np.polyfit(t_norm, p_window, poly_order)
-            doppler[i] = coeffs[-2]  # derivative at center
+            doppler[i] = -coeffs[-2]  # derivative at center
         except (np.linalg.LinAlgError, ValueError):
             if i > 0:
                 dt = t_sec[i] - t_sec[i-1]
                 if dt > 0 and dt < max_gap_sec:
-                    doppler[i] = (phases[i] - phases[i-1]) / dt
+                    doppler[i] = -(phases[i] - phases[i-1]) / dt
     
     return doppler
 
@@ -1111,65 +1176,121 @@ def parse_gnss_directory(
 # ============================================================================
 # STEP 2: SP3 MATCHING
 # ============================================================================
+"""
+GNSS Observation SP3 Matcher - CORRECTED VERSION
+Fixed based on Document 2's working implementation
+"""
+
+# GPS TIME CORRECTION
+# As of 2017, GPS Time is ahead of UTC by 18 seconds.
+# SP3 files are in GPS Time. CSV is in UTC.
+GPS_LEAP_SECONDS = 18.0
+
+
+@dataclass
+class ProcessingResult:
+    success: bool
+    data: Optional[pd.DataFrame]
+    message: str
+    metadata: Dict
+
 
 class SP3Parser:
+    """High-precision SP3 parser with microsecond-level interpolation support"""
+    
     CONSTELLATION_MAP = {'GPS': 'G', 'GLO': 'R', 'GAL': 'E', 'BDS': 'C', 'QZS': 'J', 'IRN': 'I'}
 
     def __init__(self, sp3_file: str):
         self.epochs: Dict[datetime, Dict[str, Dict]] = {}
         self.satellites: set = set()
-        self._epoch_timestamps: Dict[datetime, float] = {}
         self._parse(sp3_file)
 
     def _parse(self, filename: str) -> None:
+        """Parse SP3 file. Note: SP3 timestamps are natively GPS Time."""
         with open(filename, 'r') as f:
             lines = f.readlines()
+        
         current_epoch = None
+        
         for line in lines:
             line = line.strip()
+            
+            # Parse epoch line: * 2025  7 24  9  0  0.00000000
             if line.startswith('*'):
                 parts = line.split()
                 if len(parts) >= 7:
                     try:
-                        year, month, day = int(parts[1]), int(parts[2]), int(parts[3])
-                        hour, minute, second = int(parts[4]), int(parts[5]), float(parts[6])
+                        year = int(parts[1])
+                        month = int(parts[2])
+                        day = int(parts[3])
+                        hour = int(parts[4])
+                        minute = int(parts[5])
+                        second = float(parts[6])
+                        
+                        # Parse as standard datetime representing GPS Time
                         dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
                         dt += timedelta(seconds=second)
+                        # Store as NAIVE datetime (this represents GPS time)
                         current_epoch = dt.replace(tzinfo=None)
+                        
                         if current_epoch not in self.epochs:
                             self.epochs[current_epoch] = {}
-                            self._epoch_timestamps[current_epoch] = dt.timestamp()
+                            
                     except (ValueError, IndexError):
                         continue
+            
+            # Parse position line
             elif line.startswith('P') and current_epoch is not None:
                 try:
                     sat_id = line[1:4]
                     parts = line[4:].split()
+                    
                     if len(parts) >= 4:
-                        x = np.float64(parts[0]) * 1000.0
+                        x = np.float64(parts[0]) * 1000.0  # km -> m
                         y = np.float64(parts[1]) * 1000.0
                         z = np.float64(parts[2]) * 1000.0
                         clk = np.float64(parts[3]) * 1e-6
+                        
                         if abs(x) < 50000000 and abs(y) < 50000000:
-                            self.epochs[current_epoch][sat_id] = {'x': x, 'y': y, 'z': z, 'clk': clk}
+                            self.epochs[current_epoch][sat_id] = {
+                                'x': x, 'y': y, 'z': z, 'clk': clk
+                            }
                             self.satellites.add(sat_id)
+                            
                 except (ValueError, IndexError):
                     continue
 
     def interpolate(self, sat_id: str, target_time_utc: datetime) -> Optional[Dict]:
+        """
+        Get satellite position with GPS-UTC Time Sync
+        target_time_utc: The UTC time from the Observation CSV
+        """
         if pd.isna(target_time_utc) or target_time_utc is pd.NaT:
             return None
+        
+        # Convert to naive datetime if needed
         if hasattr(target_time_utc, 'to_pydatetime'):
             target_time_utc = target_time_utc.to_pydatetime()
+        
+        # Ensure naive UTC
         if hasattr(target_time_utc, 'tzinfo') and target_time_utc.tzinfo is not None:
             target_time_utc = target_time_utc.astimezone(timezone.utc).replace(tzinfo=None)
 
+        # ### GPS TIME CORRECTION ###
+        # To find the satellite position at 12:00:00 UTC, we must look up 
+        # 12:00:18 in the SP3 file (because SP3 is GPS time).
         target_time_gps = target_time_utc + timedelta(seconds=GPS_LEAP_SECONDS)
+
+        # Convert satellite ID format
         sp3_sat_id = self._convert_sat_id(sat_id)
         if not sp3_sat_id:
             return None
 
-        available_epochs, positions, clocks = [], [], []
+        # Collect available epochs for this satellite
+        available_epochs = []
+        positions = []
+        clocks = []
+        
         for epoch_time, epoch_data in self.epochs.items():
             if sp3_sat_id in epoch_data:
                 available_epochs.append(epoch_time)
@@ -1180,16 +1301,25 @@ class SP3Parser:
         if len(available_epochs) < 4:
             return None
 
-        available_timestamps = np.array([self._epoch_timestamps[ep] for ep in available_epochs], dtype=np.float64)
-        sorted_indices = np.argsort(available_timestamps)
-        available_timestamps = available_timestamps[sorted_indices]
+        # Sort by time (all naive datetimes)
+        sorted_indices = np.argsort([t.timestamp() for t in available_epochs])
+        available_epochs = [available_epochs[i] for i in sorted_indices]
         positions = np.array([positions[i] for i in sorted_indices], dtype=np.float64)
         clocks = np.array([clocks[i] for i in sorted_indices], dtype=np.float64)
-
-        target_timestamp_gps = target_time_gps.replace(tzinfo=timezone.utc).timestamp()
+        
+        # Convert to timestamps CONSISTENTLY (all from naive datetimes)
+        available_timestamps = np.array([t.timestamp() for t in available_epochs], dtype=np.float64)
+        
+        # Use GPS Time for the interpolation target (also naive datetime)
+        target_timestamp_gps = target_time_gps.timestamp()
+        
+        # *** CRITICAL RANGE CHECK ***
+        # This check ensures we only interpolate within the SP3 file's time range
+        # If observation is from a different day than SP3, this will correctly return None
         if target_timestamp_gps < available_timestamps[0] or target_timestamp_gps > available_timestamps[-1]:
             return None
 
+        # Find interpolation window
         window_size = min(12, len(available_timestamps))
         center_idx = np.argmin(np.abs(available_timestamps - target_timestamp_gps))
         start_idx = max(0, center_idx - window_size // 2)
@@ -1199,71 +1329,131 @@ class SP3Parser:
         pos_window = positions[start_idx:end_idx]
         clk_window = clocks[start_idx:end_idx]
 
+        # Perform cubic spline interpolation
         try:
             cs_x = CubicSpline(t_window, pos_window[:, 0], bc_type='natural')
             cs_y = CubicSpline(t_window, pos_window[:, 1], bc_type='natural')
             cs_z = CubicSpline(t_window, pos_window[:, 2], bc_type='natural')
             cs_clk = CubicSpline(t_window, clk_window, bc_type='natural')
 
+            # Evaluate at GPS Time
+            interp_x = np.float64(cs_x(target_timestamp_gps))
+            interp_y = np.float64(cs_y(target_timestamp_gps))
+            interp_z = np.float64(cs_z(target_timestamp_gps))
+            interp_clk = np.float64(cs_clk(target_timestamp_gps))
+            
+            vel_x = np.float64(cs_x.derivative()(target_timestamp_gps))
+            vel_y = np.float64(cs_y.derivative()(target_timestamp_gps))
+            vel_z = np.float64(cs_z.derivative()(target_timestamp_gps))
+
             return {
-                'gps_time_used': target_time_gps,
-                'interp_x': np.float64(cs_x(target_timestamp_gps)),
-                'interp_y': np.float64(cs_y(target_timestamp_gps)),
-                'interp_z': np.float64(cs_z(target_timestamp_gps)),
-                'interp_vel_x': np.float64(cs_x.derivative()(target_timestamp_gps)),
-                'interp_vel_y': np.float64(cs_y.derivative()(target_timestamp_gps)),
-                'interp_vel_z': np.float64(cs_z.derivative()(target_timestamp_gps)),
-                'interp_speed': np.sqrt(
-                    cs_x.derivative()(target_timestamp_gps)**2 + 
-                    cs_y.derivative()(target_timestamp_gps)**2 + 
-                    cs_z.derivative()(target_timestamp_gps)**2
-                ),
-                'interp_clk': np.float64(cs_clk(target_timestamp_gps)),
-                'interp_clk_rate': np.float64(cs_clk.derivative()(target_timestamp_gps)),  # ADD THIS
+                'gps_time_used': target_time_gps.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                'interp_x': interp_x,
+                'interp_y': interp_y,
+                'interp_z': interp_z,
+                'interp_vel_x': vel_x,
+                'interp_vel_y': vel_y,
+                'interp_vel_z': vel_z,
+                'interp_speed': np.sqrt(vel_x**2 + vel_y**2 + vel_z**2),
+                'interp_clk': interp_clk,
+                'interp_clk_rate': np.float64(cs_clk.derivative()(target_timestamp_gps))
             }
         except Exception:
             return None
 
     def _convert_sat_id(self, gnss_sv_string: str) -> Optional[str]:
+        """Convert satellite ID from CSV format to SP3 format"""
         if not isinstance(gnss_sv_string, str):
             return None
+        
         gnss_sv_string = gnss_sv_string.strip()
+        
+        # Already in SP3 format (e.g., "G01", "E12")
         if len(gnss_sv_string) == 3 and gnss_sv_string[0].isalpha() and gnss_sv_string[1:].isdigit():
             return gnss_sv_string.upper()
+        
+        # CSV format (e.g., "GPS 1", "GAL 12")
         parts = gnss_sv_string.split()
         if len(parts) == 2:
             try:
-                prefix = self.CONSTELLATION_MAP.get(parts[0].strip().upper())
+                constellation = parts[0].strip().upper()
+                sv_id = int(parts[1])
+                prefix = self.CONSTELLATION_MAP.get(constellation)
                 if prefix:
-                    return f"{prefix}{int(parts[1]):02d}"
+                    return f"{prefix}{sv_id:02d}"
             except ValueError:
                 pass
+        
         return None
 
 
 def match_observations_with_sp3(
-    obs_csv: str, sp3_file: str, output_csv: Optional[str] = None,
-    progress_callback: Optional[Callable] = None, batch_size: int = 2000
+    obs_csv: str,
+    sp3_file: str,
+    output_csv: Optional[str] = None,
+    progress_callback: Optional[Callable] = None,
+    batch_size: int = 2000
 ) -> ProcessingResult:
+    """
+    Match observations from CSV with SP3 satellite positions
+    
+    Args:
+        obs_csv: Path to observations CSV file (UTC timestamps)
+        sp3_file: Path to SP3 file (GPS time)
+        output_csv: Optional path for matched output
+        progress_callback: Optional callback(message, fraction)
+        batch_size: Progress update interval
+    
+    Returns:
+        ProcessingResult with matched data
+    """
+    # Load observations
     df = pd.read_csv(obs_csv)
-    df['parsed_utc'] = pd.to_datetime(df['utc'], errors='coerce')
+    
+
+    # Parse UTC timestamps
+    df['parsed_utc'] = pd.to_datetime(df['utc'], format='mixed', errors='coerce')
     df['parsed_utc'] = df['parsed_utc'].dt.tz_localize(None)
+
+
+    # === TEMP DEBUG: Write next to the input CSV ===
+    import os
+    debug_path = obs_csv.replace('.csv', '_DEBUG.txt')
+    with open(debug_path, 'w') as f:
+        f.write(f"Rows before dropna: {len(df)}\n")
+        f.write(f"Rows with valid parsed_utc: {df['parsed_utc'].notna().sum()}\n")
+    # === END DEBUG ===
+
+
+    
     df = df.dropna(subset=['parsed_utc'])
+    
+
+    # Create satellite identifier
     df['sat_identifier'] = df['gnssId'].astype(str) + ' ' + df['svId'].astype(str)
 
+    # Initialize SP3 parser
     sp3 = SP3Parser(sp3_file)
 
-    sp3_cols = ['gps_time_used', 'interp_x', 'interp_y', 'interp_z',
-                'interp_vel_x', 'interp_vel_y', 'interp_vel_z',
-                'interp_speed', 'interp_clk', 'sp3_match_status']
+    # Add SP3 columns
+    sp3_cols = [
+        'gps_time_used',
+        'interp_x', 'interp_y', 'interp_z',
+        'interp_vel_x', 'interp_vel_y', 'interp_vel_z',
+        'interp_speed', 'interp_clk', 'interp_clk_rate',
+        'sp3_match_status'
+    ]
     for col in sp3_cols:
         df[col] = np.nan
     df['sp3_match_status'] = 'no_match'
 
-    matched_count, total_count = 0, len(df)
+    matched_count = 0
+    total_count = len(df)
 
+    # Match each observation
     for idx, row in df.iterrows():
         sp3_data = sp3.interpolate(row['sat_identifier'], row['parsed_utc'])
+        
         if sp3_data:
             for key, value in sp3_data.items():
                 if key in df.columns:
@@ -1275,22 +1465,33 @@ def match_observations_with_sp3(
             frac = 0.1 + 0.25 * ((idx + 1) / total_count)
             progress_callback(f"SP3 matching: {idx + 1:,}/{total_count:,}", frac)
 
+
+    # Extract matched rows
     df_matched = df[df['sp3_match_status'] == 'matched'].copy()
+    
+    # Save if requested
     if output_csv and not df_matched.empty:
         df_matched.to_csv(output_csv, index=False)
 
     return ProcessingResult(
-        success=True, data=df_matched,
+        success=True,
+        data=df_matched,
         message=f"Matched {matched_count}/{total_count} observations",
         metadata={'total': total_count, 'matched': matched_count}
     )
-
 
 # ============================================================================
 # STEP 3A & 3B: ELEVATION AND DOPPLER
 # ============================================================================
 
-def calculate_accurate_elevations(input_csv: str, station: StationConfig, output_csv: Optional[str] = None) -> ProcessingResult:
+
+def calculate_accurate_elevations(
+    input_csv: str, 
+    station: StationConfig, 
+    output_csv: Optional[str] = None
+) -> ProcessingResult:
+    """Calculate accurate elevation angles from SP3 satellite positions"""
+    
     df = pd.read_csv(input_csv)
     
     # Convert elevation to numeric, coercing empty/invalid to NaN
@@ -1302,11 +1503,18 @@ def calculate_accurate_elevations(input_csv: str, station: StationConfig, output
         df = df[df['elevation'] >= -5]
     
     if df.empty:
-        return ProcessingResult(False, message="No observations after elevation filter")
+        return ProcessingResult(
+            success=False,
+            data=None,
+            message="No observations after elevation filter",
+            metadata={'filtered_count': 0}  # FIXED: Added metadata
+        )
     
     station_xyz = station.to_ecef()
     
     elevations = []
+    failed_count = 0
+    
     for _, r in df.iterrows():
         try:
             sat_xyz = np.array([r['interp_x'], r['interp_y'], r['interp_z']])
@@ -1314,8 +1522,12 @@ def calculate_accurate_elevations(input_csv: str, station: StationConfig, output
             elevations.append(elev)
         except (KeyError, ValueError):
             elevations.append(np.nan)
+            failed_count += 1
     
     df['accurate_elevation'] = elevations
+    
+    # Count before filtering
+    before_filter = len(df)
     
     # Now filter on computed accurate_elevation
     df = df[df['accurate_elevation'] >= -5]
@@ -1324,10 +1536,16 @@ def calculate_accurate_elevations(input_csv: str, station: StationConfig, output
         df.to_csv(output_csv, index=False)
     
     return ProcessingResult(
-        success=True, 
-        data=df, 
-        message=f"Calculated elevations for {len(df)} observations"
+        success=True,
+        data=df,
+        message=f"Calculated elevations for {len(df)} observations",
+        metadata={  # FIXED: Added metadata
+            'total_processed': before_filter,
+            'passed_filter': len(df),
+            'failed_calculations': failed_count
+        }
     )
+
 
 def calculate_geometric_doppler(
     input_csv: str, 
@@ -1344,8 +1562,14 @@ def calculate_geometric_doppler(
     required_cols = ['pseudorange', 'sigID', 'interp_x', 'interp_y', 'interp_z',
                      'interp_vel_x', 'interp_vel_y', 'interp_vel_z']
     missing = [c for c in required_cols if c not in df.columns]
+    
     if missing:
-        return ProcessingResult(False, message=f"Missing columns: {missing}")
+        return ProcessingResult(
+            success=False,
+            data=None,
+            message=f"Missing columns: {missing}",
+            metadata={'missing_columns': missing}  # FIXED: Added metadata
+        )
     
     # Convert pseudorange to numeric
     df['pseudorange'] = pd.to_numeric(df['pseudorange'], errors='coerce')
@@ -1355,23 +1579,34 @@ def calculate_geometric_doppler(
     df = df.dropna(subset=['pseudorange', 'sigID']).copy()
     
     if df.empty:
-        return ProcessingResult(False, message="No valid observations after filtering")
+        return ProcessingResult(
+            success=False,
+            data=None,
+            message="No valid observations after filtering",
+            metadata={'initial_count': initial_count, 'valid_count': 0}  # FIXED: Added metadata
+        )
     
     station_ecef = station.to_ecef()
     
+    # Calculate time delay
     df['time_delay_s'] = df['pseudorange'] / SPEED_OF_LIGHT
     
+    # Get satellite positions and velocities
     sat_pos = df[['interp_x', 'interp_y', 'interp_z']].values
     sat_vel_ecef = df[['interp_vel_x', 'interp_vel_y', 'interp_vel_z']].values
     
+    # Calculate satellite position at transmission time
     sat_pos_tx = sat_pos - sat_vel_ecef * df['time_delay_s'].values[:, np.newaxis]
     
+    # Line-of-sight calculations
     los_vector = sat_pos_tx - station_ecef
     los_dist = np.linalg.norm(los_vector, axis=1)
     los_unit = los_vector / los_dist[:, np.newaxis]
     
+    # Range rate
     range_rate = np.einsum('ij,ij->i', sat_vel_ecef, los_unit)
     
+    # Sagnac effect
     sagnac_rate = EARTH_ROTATION_RATE * (
         sat_vel_ecef[:, 0] * station_ecef[1] - sat_vel_ecef[:, 1] * station_ecef[0]
     ) / SPEED_OF_LIGHT
@@ -1400,6 +1635,7 @@ def calculate_geometric_doppler(
     clk_rate = df['interp_clk_rate'].values if 'interp_clk_rate' in df.columns else 0
     clock_doppler = carrier_freq * clk_rate
     
+    # Calculate geometric Doppler
     df['geometric_doppler'] = -carrier_freq * (range_rate + sagnac_rate) / SPEED_OF_LIGHT + clock_doppler
     df['carrier_freq_hz'] = carrier_freq  # Store for debugging
     
@@ -1411,10 +1647,15 @@ def calculate_geometric_doppler(
         msg += f" ({freq_missing_count} used fallback frequency)"
     
     return ProcessingResult(
-        success=True, 
-        data=df, 
+        success=True,
+        data=df,
         message=msg,
-        metadata={'freq_fallback_count': freq_missing_count}
+        metadata={  # FIXED: Added metadata
+            'total_observations': len(df),
+            'freq_fallback_count': freq_missing_count,
+            'initial_count': initial_count,
+            'dropped_count': initial_count - len(df)
+        }
     )
 
 
@@ -1427,21 +1668,24 @@ def diagnose_high_elevation_bias(input_csv: str, elevation_threshold: float = 45
     
     high_elev = df[df[elev_col] >= elevation_threshold].copy()
     
-    print(f"High elevation (>{elevation_threshold}°) excess_doppler statistics:")
+    print(f"\nHigh elevation (>{elevation_threshold}°) excess_doppler statistics:")
     print(f"  Count: {len(high_elev)}")
-    print(f"  Mean:  {high_elev['excess_doppler'].mean():.2f} Hz")
-    print(f"  Std:   {high_elev['excess_doppler'].std():.2f} Hz")
-    print(f"  Min:   {high_elev['excess_doppler'].min():.2f} Hz")
-    print(f"  Max:   {high_elev['excess_doppler'].max():.2f} Hz")
     
-    print("\nPer-satellite breakdown:")
-    for sat_id, group in high_elev.groupby(['gnssId', 'svId']):
-        mean = group['excess_doppler'].mean()
-        std = group['excess_doppler'].std()
-        print(f"  {sat_id[0]}_{sat_id[1]:02d}: mean={mean:+.2f} Hz, std={std:.2f} Hz, n={len(group)}")
+    if len(high_elev) > 0:
+        print(f"  Mean:  {high_elev['excess_doppler'].mean():.2f} Hz")
+        print(f"  Std:   {high_elev['excess_doppler'].std():.2f} Hz")
+        print(f"  Min:   {high_elev['excess_doppler'].min():.2f} Hz")
+        print(f"  Max:   {high_elev['excess_doppler'].max():.2f} Hz")
+        
+        print("\nPer-satellite breakdown:")
+        for sat_id, group in high_elev.groupby(['gnssId', 'svId']):
+            mean = group['excess_doppler'].mean()
+            std = group['excess_doppler'].std()
+            print(f"  {sat_id[0]}_{sat_id[1]:02d}: mean={mean:+.2f} Hz, std={std:.2f} Hz, n={len(group)}")
+    else:
+        print("  No observations found at this elevation threshold")
     
     return high_elev
-
 
 # ============================================================================
 # STEP 4: SINGLE DIFFERENCING & 2ND ORDER POLYNOMIAL FIT
@@ -1730,6 +1974,178 @@ class BendingAngleRetriever:
         self.R_local = station.get_gaussian_radius()
         self.c = SPEED_OF_LIGHT
 
+    def _get_height_range_max(self, config: 'PipelineConfig') -> float:
+        """
+        Compute the maximum physically meaningful impact height (km).
+        
+        From Bouguer's law, the maximum impact parameter for a ground-based 
+        receiver is a_max = n_r * r_r (when the ray is horizontal). The 
+        corresponding impact height is:
+        
+            h_max = a_max - R_c = (n_r - 1)*R_c + n_r*h_station
+        
+        For a sea-level station this is ~2 km; higher stations get slightly
+        less excess because n_r decreases with altitude.
+        
+        A 1 km margin is added for measurement noise and numerical tolerance.
+        """
+        if config.height_range_max > 0:
+            return config.height_range_max  # user override
+        
+        h_station = self.station.altitude  # meters
+        R_c = self.R_local                 # meters
+        
+        # Refractive index at station
+        N_station = self.station.get_surface_refractivity()
+        n_r = 1.0 + N_station * 1e-6
+        
+        # Bouguer upper bound + 1 km margin
+        r_r = R_c + h_station
+        h_max_m = n_r * r_r - R_c + 1000.0  # 1 km margin
+        return h_max_m / 1000.0  # convert to km
+
+    @staticmethod
+    def _ecef_to_geodetic_lat(x, y, z):
+        """Fast ECEF to geodetic latitude only (degrees). Bowring method."""
+        a = WGS84_A
+        b = a * (1 - 1 / 298.257223563)
+        e2 = WGS84_E2
+        ep2 = (a / b) ** 2 - 1
+        p = np.sqrt(x**2 + y**2)
+        theta = np.arctan2(z * a, p * b)
+        lat = np.arctan2(
+            z + ep2 * b * np.sin(theta)**3,
+            p - e2 * a * np.cos(theta)**3
+        )
+        return np.degrees(lat)
+
+    @staticmethod
+    def _gaussian_radius_at_lat(lat_deg):
+        """
+        Compute Gaussian mean radius of curvature at a given geodetic latitude.
+        R = sqrt(M * N) where M = meridional, N = normal radius of curvature.
+        """
+        lat_r = np.radians(lat_deg)
+        sin_lat = np.sin(lat_r)
+        denom = 1 - WGS84_E2 * sin_lat**2
+        M = WGS84_A * (1 - WGS84_E2) / denom**1.5
+        N = WGS84_A / np.sqrt(denom)
+        return np.sqrt(M * N)
+
+    @staticmethod
+    def _impact_param_to_tangent_height(a_m, R_c_m, N_surface=315.0, H_scale=7000.0,
+                                         tol=0.01, max_iter=20):
+        """
+        Solve for geometric tangent point height from impact parameter.
+        
+        At the tangent point, Bouguer's law gives (Hajj Eq. 14b, sinφ=1):
+            a = n(r_tp) · r_tp
+        
+        Given a and R_c, solve for t where r_tp = R_c + t and
+        n(r) = 1 + N_surface·10⁻⁶ · exp(-t / H_scale).
+        
+        Uses fixed-point iteration: t_{k+1} = a / n(R_c + t_k) - R_c
+        Converges in 3-5 iterations to sub-cm accuracy.
+        
+        Args:
+            a_m: Impact parameter (m), scalar or array
+            R_c_m: Local radius of curvature (m), scalar or array
+            N_surface: Surface refractivity in N-units (default 315)
+            H_scale: Atmospheric scale height in meters (default 7000)
+            tol: Convergence tolerance in meters
+            max_iter: Maximum iterations
+            
+        Returns:
+            Geometric tangent point height in meters
+        """
+        a_m = np.asarray(a_m, dtype=float)
+        R_c_m = np.asarray(R_c_m, dtype=float)
+        
+        # Initial guess: vacuum approximation (n=1)
+        t = a_m - R_c_m
+        
+        for _ in range(max_iter):
+            # Clamp t for exp stability (below surface is fine physically)
+            t_safe = np.clip(t, -50000.0, 200000.0)
+            n = 1.0 + N_surface * 1e-6 * np.exp(-t_safe / H_scale)
+            t_new = a_m / n - R_c_m
+            if np.all(np.abs(t_new - t) < tol):
+                break
+            t = t_new
+        
+        return t_new
+
+    def _estimate_tangent_point_radius(self, r_sat_ecef):
+        """
+        Estimate the local Earth radius of curvature at the ray's tangent point.
+        
+        For ground-based RO, the tangent point (where the ray is closest to Earth)
+        is always near the station — unlike space-based RO where it can be thousands
+        of km from both endpoints. The ray bends down from the satellite and arrives
+        at the ground station; the lowest point of the ray is between the station 
+        and the satellite but displaced by only a few tens of km from the station.
+        
+        At the station's horizon distance (~25 km for h=50m), the latitude change 
+        is only ~0.2°, giving negligible R change. Therefore, for ground-based RO,
+        the station's local radius of curvature is the appropriate R_c.
+        
+        For better accuracy, we compute R at a latitude slightly displaced toward 
+        the satellite's sub-point, weighted by the ratio of station altitude to 
+        satellite distance (which determines how far the tangent point is from 
+        the station).
+        
+        Reference: Hajj et al. 2002, Section 4.2 (adapted for ground-based geometry)
+        """
+        r_r = self.r_rec_ecef  # receiver ECEF
+        r_t = r_sat_ecef       # transmitter ECEF
+        
+        r_r_mag = np.linalg.norm(r_r)
+        r_t_mag = np.linalg.norm(r_t)
+        
+        if r_r_mag < 1e-6 or r_t_mag < 1e-6:
+            return self.R_local  # fallback
+        
+        # For ground-based RO, the tangent point is displaced from the station
+        # toward the satellite's sub-point by a small amount. The displacement
+        # depends on the elevation angle: at horizon (~0°), it's at the geometric
+        # horizon distance; at higher elevations, it's essentially at the station.
+        #
+        # A first-order estimate: interpolate latitude toward satellite sub-point
+        # with a small weight proportional to (horizon_distance / sat_distance).
+        # For h_station=50m: horizon ≈ 25km, sat_distance ≈ 25000km → weight ≈ 0.001
+        # This makes the correction negligible in practice.
+        
+        r_rec_dir = r_r / r_r_mag
+        r_sat_dir = r_t / r_t_mag
+        
+        # Compute elevation angle to determine how close tangent point is to station
+        los = r_t - r_r
+        los_mag = np.linalg.norm(los)
+        if los_mag < 1e-6:
+            return self.R_local
+        los_unit = los / los_mag
+        up = r_rec_dir
+        sin_elev = np.dot(los_unit, up)
+        
+        # For low elevation (RO regime), tangent point is slightly displaced
+        # toward horizon. Weight based on geometric horizon fraction.
+        horizon_dist = np.sqrt(2 * r_r_mag * self.station.altitude) if self.station.altitude > 0 else 0
+        weight = min(horizon_dist / los_mag, 0.01)  # tiny correction
+        
+        # Interpolate direction toward satellite sub-point
+        tp_dir = (1 - weight) * r_rec_dir + weight * r_sat_dir
+        tp_norm = np.linalg.norm(tp_dir)
+        if tp_norm < 1e-10:
+            return self.R_local
+        tp_dir = tp_dir / tp_norm
+        
+        # Get geodetic latitude at tangent point
+        tp_lat = self._ecef_to_geodetic_lat(
+            tp_dir[0] * WGS84_A, tp_dir[1] * WGS84_A, tp_dir[2] * WGS84_A
+        )
+        
+        return self._gaussian_radius_at_lat(tp_lat)
+
     def solve_single_freq(
         self, 
         doppler: float, 
@@ -1745,6 +2161,12 @@ class BendingAngleRetriever:
         - Atmospheric Doppler arises from ray bending changing the effective
           direction of signal propagation at the satellite
         
+        For ground-based RO, the receiver is inside the atmosphere, so 
+        Bouguer's law requires n_r at the receiver:
+            a = r_t * n_t * sin(θ_t + δ_t) = r_r * n_r * sin(θ_r + δ_r)
+        where n_t ≈ 1 at GPS altitude but n_r ≈ 1.0003 at the ground.
+        (Hajj et al. 2002, Eq. 14b)
+        
         Args:
             doppler: Atmospheric Doppler (Hz) - geometric already removed
             v_sat_ecef: Satellite velocity in ECEF (m/s)
@@ -1757,6 +2179,14 @@ class BendingAngleRetriever:
         r_t = r_sat_ecef
         v_t = v_sat_ecef
         r_r = self.r_rec_ecef
+        
+        # Refractive index at receiver (ground station, inside atmosphere)
+        # Uses actual surface met data if available, otherwise standard atmosphere
+        N_station = self.station.get_surface_refractivity()  # N-units at station level
+        n_receiver = 1.0 + N_station * 1e-6
+        
+        # At GPS altitude (~20,200 km), n_transmitter ≈ 1 (vacuum)
+        n_transmitter = 1.0
         
         # Straight-line direction (no bending)
         L_vec = r_r - r_t
@@ -1788,23 +2218,54 @@ class BendingAngleRetriever:
             doppler_model = np.dot(v_t, k_t - k0) / wavelength
             eq1 = doppler - doppler_model
             
-            # Impact parameter constraint: |r × k| same at both ends
-            # (ray asymptotes have same closest approach distance)
-            a_t = np.linalg.norm(np.cross(r_t, k_t))
-            a_r = np.linalg.norm(np.cross(r_r, k_r))
+            # Bouguer's law: a = n*r*sin(ψ) = n * |r × k̂|
+            # At transmitter: n_t ≈ 1, so a_t = |r_t × k̂_t|
+            # At receiver: n_r ≈ 1.0003, so a_r = n_r * |r_r × k̂_r|
+            a_t = n_transmitter * np.linalg.norm(np.cross(r_t, k_t))
+            a_r = n_receiver * np.linalg.norm(np.cross(r_r, k_r))
             eq2 = a_t - a_r
             
             return [eq1, eq2]
 
         try:
-            dt_sol, dr_sol = fsolve(equations, [1e-5, 1e-4], full_output=False)
+            result = fsolve(equations, [1e-5, 1e-4], full_output=True)
+            dt_sol, dr_sol = result[0]
+            info_dict = result[1]   # dict with 'fvec', 'fjac', etc.
+            ier = result[2]          # integer flag: 1 = solution found
+            mesg = result[3]         # string message
             
-            # Total bending angle
-            bending_angle = np.abs(dt_sol) + np.abs(dr_sol)
+            # Check convergence: ier==1 means solution found
+            if ier != 1:
+                return np.nan, np.nan
             
-            # Impact parameter from transmitter side
-            k_t_sol = rotate_vec(k0, axis, -dt_sol)
-            impact_parameter = np.linalg.norm(np.cross(r_t, k_t_sol))
+            # Check residual magnitude
+            residual = np.linalg.norm(info_dict['fvec'])
+            if residual > 1e-3:
+                return np.nan, np.nan
+            
+            # Compute total bending angle.
+            # For ground-based RO, the rotation convention means individual 
+            # components dt_sol and dr_sol can have either sign. The total 
+            # deflection angle is the sum of absolute values.
+            # Physical sanity: atmospheric bending at GPS frequencies is
+            # ~0.02 rad at surface, up to ~0.05 rad in extreme humidity.
+            bending_angle = abs(dt_sol) + abs(dr_sol)
+            
+            if bending_angle > 0.1 or bending_angle < 1e-10:
+                return np.nan, np.nan  # unphysical
+            
+            # Impact parameter: use RECEIVER side for ground-based RO.
+            # The transmitter side (r_t ~ 26,500 km) amplifies tiny angular
+            # errors in k_t into large impact parameter errors. The receiver
+            # side (r_r ~ 6,371 km) is 4× less sensitive to angular errors.
+            k_r_sol = rotate_vec(k0, axis, dr_sol)
+            impact_parameter = n_receiver * np.linalg.norm(np.cross(r_r, k_r_sol))
+            
+            # Bouguer upper bound: a ≤ n_r * r_r (equality when ray is horizontal).
+            # Values exceeding this are unphysical for ground-based geometry.
+            a_max_physical = n_receiver * np.linalg.norm(r_r)
+            if impact_parameter > a_max_physical * 1.001:  # 0.1% tolerance
+                return np.nan, np.nan
             
             return bending_angle, impact_parameter
         except Exception:
@@ -1858,7 +2319,7 @@ class BendingAngleRetriever:
 
             f1, f2 = SIGNAL_FREQUENCIES[s1], SIGNAL_FREQUENCIES[s2]
             lam1, lam2 = self.c / f1, self.c / f2
-            res_f1, res_f2 = {'utc': [], 'a': [], 'alpha': []}, {'utc': [], 'a': [], 'alpha': []}
+            res_f1, res_f2 = {'utc': [], 'a': [], 'alpha': [], 'r_sat_x': [], 'r_sat_y': [], 'r_sat_z': []}, {'utc': [], 'a': [], 'alpha': []}
 
             for t, row in merged.iterrows():
                 # Satellite state (ECEF)
@@ -1881,6 +2342,9 @@ class BendingAngleRetriever:
                     res_f1['utc'].append(row['utc_f1'])
                     res_f1['a'].append(a1)
                     res_f1['alpha'].append(alpha1)
+                    res_f1['r_sat_x'].append(r_sat[0])
+                    res_f1['r_sat_y'].append(r_sat[1])
+                    res_f1['r_sat_z'].append(r_sat[2])
                 if not np.isnan(a2) and alpha2 > 0:
                     res_f2['utc'].append(row['utc_f2'])
                     res_f2['a'].append(a2)
@@ -1896,26 +2360,108 @@ class BendingAngleRetriever:
 
             try:
                 # Ionospheric correction via dual-frequency combination
-                alpha2_interp = interp1d(d2['a'], d2['alpha'], kind='linear', fill_value="extrapolate")(d1['a'])
+                # Use smooth-cubic (piecewise Hermite) interpolation as described
+                # in Hajj et al. 2002, §4.3: "This 'smooth-cubic' interpolation 
+                # scheme avoids introducing sharp variations between the points 
+                # when the data is noisy."
+                #
+                # Conditions: f(t_j) = f_j and f'(t_j) = (f_{j+1}-f_{j-1})/(t_{j+1}-t_{j-1})
+                # This is equivalent to a Catmull-Rom / cardinal spline.
+                
+                # Restrict interpolation to the overlap range (no extrapolation)
+                a1_vals = d1['a'].values
+                a2_vals = d2['a'].values
+                a2_alpha = d2['alpha'].values
+                
+                a_min_overlap = max(a1_vals.min(), a2_vals.min())
+                a_max_overlap = min(a1_vals.max(), a2_vals.max())
+                
+                # Only process points within overlap range
+                overlap_mask = (a1_vals >= a_min_overlap) & (a1_vals <= a_max_overlap)
+                if overlap_mask.sum() < config.min_epochs_for_bending:
+                    continue
+                
+                # Compute smooth-cubic (Hermite) interpolation
+                # Estimate derivatives at each knot as central differences
+                n_knots = len(a2_vals)
+                slopes = np.zeros(n_knots)
+                if n_knots >= 2:
+                    # Central differences for interior points
+                    for ki in range(1, n_knots - 1):
+                        slopes[ki] = (a2_alpha[ki+1] - a2_alpha[ki-1]) / (a2_vals[ki+1] - a2_vals[ki-1])
+                    # Forward/backward differences at endpoints
+                    slopes[0] = (a2_alpha[1] - a2_alpha[0]) / (a2_vals[1] - a2_vals[0]) if n_knots > 1 else 0
+                    slopes[-1] = (a2_alpha[-1] - a2_alpha[-2]) / (a2_vals[-1] - a2_vals[-2]) if n_knots > 1 else 0
+                
+                # Build piecewise cubic Hermite interpolation (PCHIP-like)
+                # scipy's CubicHermiteSpline matches Hajj's description exactly
+                from scipy.interpolate import CubicHermiteSpline
+                hermite_interp = CubicHermiteSpline(a2_vals, a2_alpha, slopes)
+                
+                # Clamp to overlap range (no extrapolation)
+                a1_clamped = np.clip(a1_vals, a_min_overlap, a_max_overlap)
+                alpha2_interp = hermite_interp(a1_clamped)
+                
+                # Apply overlap mask: set out-of-range points to NaN
+                alpha2_full = np.full_like(a1_vals, np.nan)
+                alpha2_full[overlap_mask] = alpha2_interp[overlap_mask]
 
 
                 coeff_1 =  f1**2 / (f1**2 - f2**2)
                 coeff_2 =  f2**2 / (f1**2 - f2**2)
-                alpha_neut =  coeff_1 * d1['alpha'] - coeff_2 * alpha2_interp
-                tangent_height = (d1['a'] - self.R_local) / 1000.0
+                alpha_neut =  coeff_1 * d1['alpha'].values - coeff_2 * alpha2_full
+                
+                # Filter out points where interpolation was not available
+                valid_iono = ~np.isnan(alpha_neut)
+                if valid_iono.sum() < config.min_epochs_for_bending:
+                    continue
+                
+                d1_valid = d1[valid_iono].copy()
+                alpha_neut_valid = alpha_neut[valid_iono]
+                
+                # Compute local Earth radius at each tangent point (not station!)
+                # The tangent point can be hundreds of km from the station at a 
+                # different latitude where R differs by up to ~43 km (Hajj et al. 2002 §4.2)
+                R_tp = d1_valid.apply(
+                    lambda row: self._estimate_tangent_point_radius(
+                        np.array([row['r_sat_x'], row['r_sat_y'], row['r_sat_z']])
+                    ), axis=1
+                )
+                tangent_height = (d1_valid['a'].values - R_tp.values) / 1000.0
+
+                # Compute true geometric tangent point height by inverting
+                # Bouguer's law: a = n(r_tp) · r_tp → t = a/n(t) - R_c
+                # This differs from impact height by ~2 km near the surface
+                # (see Hajj et al. 2002, Eq. 14b)
+                # 
+                # Use station's actual surface refractivity for the n(t) model.
+                # The exponential model is n(t) = 1 + N0·10⁻⁶·exp(-t/H) where
+                # N0 is the sea-level value. Given N at station altitude h:
+                #   N0 = N_station · exp(h/H)
+                N_station = self.station.get_surface_refractivity()
+                H_scale = 7000.0
+                N_sea_level = N_station * np.exp(self.station.altitude / H_scale)
+                
+                geom_tangent_m = self._impact_param_to_tangent_height(
+                    d1_valid['a'].values, R_tp.values,
+                    N_surface=N_sea_level, H_scale=H_scale
+                )
+                geom_tangent_km = geom_tangent_m / 1000.0
 
                 out_df = pd.DataFrame({
-                    'utc': d1['utc'], 
-                    'impact_parameter_m': d1['a'], 
-                    'tangent_height_km': tangent_height,
-                    'bending_angle_rad': alpha_neut, 
-                    'bending_angle_deg': np.degrees(alpha_neut),
-                    'bending_L1': d1['alpha'], 
-                    'bending_L2': alpha2_interp,
+                    'utc': d1_valid['utc'].values, 
+                    'impact_parameter_m': d1_valid['a'].values, 
+                    'impact_height_km': tangent_height,
+                    'tangent_height_km': geom_tangent_km,
+                    'local_radius_km': R_tp.values / 1000.0,
+                    'bending_angle_rad': alpha_neut_valid, 
+                    'bending_angle_deg': np.degrees(alpha_neut_valid),
+                    'bending_L1': d1_valid['alpha'].values, 
+                    'bending_L2': alpha2_full[valid_iono],
                 })
                 out_df = out_df[
-                    (out_df['tangent_height_km'] > config.height_range_min) & 
-                    (out_df['tangent_height_km'] < config.height_range_max)
+                    (out_df['impact_height_km'] > config.height_range_min) & 
+                    (out_df['impact_height_km'] < self._get_height_range_max(config))
                 ]
 
                 if not out_df.empty and output_dir:
@@ -1928,6 +2474,8 @@ class BendingAngleRetriever:
                         'valid_epochs': len(out_df),
                         'min_height_km': out_df['tangent_height_km'].min(), 
                         'max_height_km': out_df['tangent_height_km'].max(),
+                        'min_impact_height_km': out_df['impact_height_km'].min(), 
+                        'max_impact_height_km': out_df['impact_height_km'].max(),
                         'max_bending_rad': out_df['bending_angle_rad'].max()
                     })
             except Exception:
@@ -1957,55 +2505,214 @@ def retrieve_bending_angles(
 # STEP 6: ABEL INVERSION
 # ============================================================================
 
+
 class AbelInversion:
+    """
+    Abel integral inversion for retrieving atmospheric refractivity from bending angles.
+    Implements statistical optimization blending observed and climatological bending angles.
+    
+    Uses per-level local radius of curvature from the bending angle step (Hajj et al. 2002 §4.2)
+    rather than a global mean Earth radius, which avoids latitude-dependent height biases 
+    of up to ~14 km.
+    """
+    
     def __init__(self, climatology_blend_km: float = 50.0):
-        self.R_earth = R_EARTH
+        """
+        Initialize Abel inversion processor.
+        
+        Args:
+            climatology_blend_km: Height above which to blend with climatology (km)
+        """
+        self.R_earth_mean = R_EARTH  # fallback only
         self.climatology_blend_km = climatology_blend_km
-
+    
     def run(self, bending_csv: str, output_csv: Optional[str] = None) -> ProcessingResult:
+        """
+        Perform Abel inversion on bending angle profile.
+        
+        Args:
+            bending_csv: Input CSV with bending angles
+            output_csv: Optional output path for refractivity profile
+            
+        Returns:
+            ProcessingResult with refractivity data
+        """
+        # Load and sort by impact parameter
         df = pd.read_csv(bending_csv).sort_values('impact_parameter_m').reset_index(drop=True)
-        df['approx_height_km'] = (df['impact_parameter_m'] - self.R_earth) / 1000
-
+        
+        if df.empty:
+            return ProcessingResult(
+                success=False,
+                data=None,
+                message="Empty bending angle file",
+                metadata={'input_rows': 0}
+            )
+        
+        # Use local radius from bending angle step if available;
+        # otherwise fall back to global mean (with warning).
+        if 'local_radius_km' in df.columns:
+            R_local = df['local_radius_km'].values * 1000.0  # per-level, in meters
+            R_reference = np.median(R_local)  # representative value for height estimation
+        else:
+            R_local = np.full(len(df), self.R_earth_mean)
+            R_reference = self.R_earth_mean
+        
+        # Calculate approximate heights using local radius
+        df['approx_height_km'] = (df['impact_parameter_m'].values - R_local) / 1000
+        
+        # Fit exponential to lower atmosphere for climatological reference
         fit_data = df[df['approx_height_km'] <= 40.0]
-        coeffs = np.polyfit(fit_data['impact_parameter_m'].values, np.log(fit_data['bending_angle_rad'].values + 1e-10), 1)
+        
+        if len(fit_data) < 2:
+            return ProcessingResult(
+                success=False,
+                data=None,
+                message="Insufficient data for climatology fit (<2 points below 40km)",
+                metadata={
+                    'input_rows': len(df),
+                    'fit_points': len(fit_data),
+                    'R_reference_km': R_reference / 1000.0
+                }
+            )
+        
+        # Fit log-linear model to get scale height
+        coeffs = np.polyfit(
+            fit_data['impact_parameter_m'].values,
+            np.log(fit_data['bending_angle_rad'].values + 1e-10),
+            1
+        )
         scale_height = -1.0 / coeffs[0] if coeffs[0] < 0 else 7000.0
-        a_ref, alpha_ref = fit_data['impact_parameter_m'].iloc[len(fit_data)//2], fit_data['bending_angle_rad'].iloc[len(fit_data)//2]
-
-        a_values, alpha_meas = df['impact_parameter_m'].values, df['bending_angle_rad'].values
+        
+        # Reference point for climatology
+        mid_idx = len(fit_data) // 2
+        a_ref = fit_data['impact_parameter_m'].iloc[mid_idx]
+        alpha_ref = fit_data['bending_angle_rad'].iloc[mid_idx]
+        
+        # Get arrays for processing
+        a_values = df['impact_parameter_m'].values
+        alpha_meas = df['bending_angle_rad'].values
+        
+        # Build climatological profile
         alpha_clim = alpha_ref * np.exp(-(a_values - a_ref) / scale_height)
-        a_upper = df[df['approx_height_km'] <= self.climatology_blend_km]['impact_parameter_m'].max()
-
-        sigma_meas, sigma_clim = np.full_like(alpha_meas, 1e-7), np.full_like(alpha_clim, 1e10)
+        
+        # Statistical optimization weights (Hajj Eq. 21)
+        a_upper_mask = df['approx_height_km'] <= self.climatology_blend_km
+        if a_upper_mask.any():
+            a_upper = df.loc[a_upper_mask, 'impact_parameter_m'].max()
+        else:
+            a_upper = a_values.min()
+        
+        # Measurement uncertainty (small, trust measurements)
+        sigma_meas = np.full_like(alpha_meas, 1e-7)
+        
+        # Climatology uncertainty (large below blend height, smaller above)
+        sigma_clim = np.full_like(alpha_clim, 1e10)
         sigma_clim[a_values > a_upper] = 0.05 * alpha_clim[a_values > a_upper]
-        w_meas, w_clim = 1.0 / sigma_meas**2, 1.0 / sigma_clim**2
+        
+        # Compute weights
+        w_meas = 1.0 / sigma_meas**2
+        w_clim = 1.0 / sigma_clim**2
+        
+        # Optimally blended bending angle profile
         df['bending_optimized'] = (alpha_meas * w_meas + alpha_clim * w_clim) / (w_meas + w_clim)
-
-        a, alpha = df['impact_parameter_m'].values, df['bending_optimized'].values
+        
+        # Prepare for Abel integral
+        a = df['impact_parameter_m'].values
+        alpha = df['bending_optimized'].values
         n_levels = len(a)
         ln_n = np.zeros(n_levels)
+        
+        # Abel integral computation (Hajj Eqs. 22-23)
         for i in range(n_levels):
             a_i = a[i]
+            
+            # Integration intermediate limit (a few levels above current)
             a_int_idx = min(i + 3, n_levels - 1)
             a_int = a[a_int_idx]
-            analytical = alpha[a_int_idx] * np.log(a_int + np.sqrt(a_int**2 - a_i**2)) - alpha[i] * np.log(a_i + 1e-10)
-            parts_integral = sum(-np.log((a[j] + a[j+1])/2 + np.sqrt(((a[j] + a[j+1])/2)**2 - a_i**2)) * (alpha[j+1] - alpha[j]) for j in range(i, min(a_int_idx, n_levels-1)) if (a[j] + a[j+1])/2 > a_i)
-            regular_integral = sum(((alpha[j] + alpha[j+1])/2) / np.sqrt(((a[j] + a[j+1])/2)**2 - a_i**2) * (a[j+1] - a[j]) for j in range(a_int_idx, n_levels-1) if ((a[j] + a[j+1])/2)**2 - a_i**2 > 0)
+            
+            # Analytical part (integration by parts boundary term, Eq. 23)
+            analytical = (
+                alpha[a_int_idx] * np.log(a_int + np.sqrt(max(a_int**2 - a_i**2, 1e-20))) -
+                alpha[i] * np.log(a_i + 1e-10)
+            )
+            
+            # Parts integral (integration by parts main term)
+            parts_integral = sum(
+                -np.log((a[j] + a[j+1])/2 + np.sqrt(max(((a[j] + a[j+1])/2)**2 - a_i**2, 1e-20))) * 
+                (alpha[j+1] - alpha[j])
+                for j in range(i, min(a_int_idx, n_levels-1))
+                if (a[j] + a[j+1])/2 > a_i
+            )
+            
+            # Regular integral (above a_int)
+            regular_integral = sum(
+                ((alpha[j] + alpha[j+1])/2) / 
+                np.sqrt(max(((a[j] + a[j+1])/2)**2 - a_i**2, 1e-20)) * 
+                (a[j+1] - a[j])
+                for j in range(a_int_idx, n_levels-1)
+                if ((a[j] + a[j+1])/2)**2 - a_i**2 > 0
+            )
+            
+            # Combined Abel integral (Eq. 22)
             ln_n[i] = (1.0 / np.pi) * (analytical + parts_integral + regular_integral)
-
+        
+        # Convert to refractive index
         df['refractive_index'] = np.exp(ln_n)
-        df['height_km'] = (df['impact_parameter_m'] / df['refractive_index'] - self.R_earth) / 1000.0
-        # temporary ground base adjustment 5 X
-        df['refractivity_N'] = 5* (df['refractive_index'] - 1.0) * 1e6
-        # df['refractivity_N'] = (df['refractive_index'] - 1.0) * 1e6
-
-        result_df = df[['height_km', 'refractivity_N', 'impact_parameter_m', 'bending_optimized']].copy()
+        
+        # Calculate geometric height using per-level local radius
+        # r_tangent = a / n, then height = r_tangent - R_local
+        df['height_km'] = (df['impact_parameter_m'].values / df['refractive_index'].values - R_local) / 1000.0
+        
+        # Convert to refractivity N-units — standard formula, no fudge factors
+        # N = (n - 1) × 10^6  (Hajj et al. 2002, Eq. 24)
+        df['refractivity_N'] = (df['refractive_index'] - 1.0) * 1e6
+        
+        # Prepare output
+        result_df = df[[
+            'height_km',
+            'refractivity_N',
+            'impact_parameter_m',
+            'bending_optimized'
+        ]].copy()
+        
+        # Save if requested
         if output_csv:
             result_df.to_csv(output_csv, index=False)
-        return ProcessingResult(success=True, data=result_df, message=f"Retrieved refractivity: {result_df['height_km'].min():.2f}-{result_df['height_km'].max():.2f} km")
+        
+        return ProcessingResult(
+            success=True,
+            data=result_df,
+            message=f"Retrieved refractivity: {result_df['height_km'].min():.2f}-{result_df['height_km'].max():.2f} km",
+            metadata={
+                'input_levels': len(df),
+                'output_levels': len(result_df),
+                'height_range_km': (result_df['height_km'].min(), result_df['height_km'].max()),
+                'scale_height_m': scale_height,
+                'climatology_blend_km': self.climatology_blend_km,
+                'R_reference_km': R_reference / 1000.0,
+                'uses_local_radius': 'local_radius_km' in pd.read_csv(bending_csv).columns,
+            }
+        )
 
 
-def retrieve_refractivity(bending_csv: str, output_csv: Optional[str] = None, climatology_blend_km: float = 50.0) -> ProcessingResult:
+def retrieve_refractivity(
+    bending_csv: str,
+    output_csv: Optional[str] = None,
+    climatology_blend_km: float = 50.0
+) -> ProcessingResult:
+    """
+    Convenience wrapper for Abel inversion.
+    
+    Args:
+        bending_csv: Input CSV with bending angles
+        output_csv: Optional output path
+        climatology_blend_km: Height for climatology blending (km)
+        
+    Returns:
+        ProcessingResult with refractivity profile
+    """
     return AbelInversion(climatology_blend_km).run(bending_csv, output_csv)
+
 
 
 # ============================================================================
@@ -2140,15 +2847,26 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
     if 'atmos_doppler' in df.columns and 'utc_parsed' in df.columns and 'sigID' in df.columns:
         valid = df.dropna(subset=['atmos_doppler', 'utc_parsed'])
         if not valid.empty:
-            # Scatter plot of raw atmos_doppler per frequency
-            colors = {'L1C/A': '#1976D2', 'L2CL': '#D32F2F', 'B1I D1': '#1976D2', 'B2I D1': '#D32F2F', 
-                      'E1C': '#1976D2', 'E5bQ': '#D32F2F', 'L1OF': '#1976D2', 'L2OF': '#D32F2F'}
+            # Scatter dot colors per frequency (lighter shades)
+            dot_colors = {
+                'L1C/A': '#EF5350', 'L2CL': '#42A5F5',
+                'B1I D1': '#EF5350', 'B2I D1': '#42A5F5',
+                'E1C': '#EF5350', 'E5bQ': '#42A5F5',
+                'L1OF': '#EF5350', 'L2OF': '#42A5F5',
+            }
+            # Darker line colors for polynomial interpolation
+            line_colors = {
+                'L1C/A': '#B71C1C', 'L2CL': '#0D47A1',
+                'B1I D1': '#B71C1C', 'B2I D1': '#0D47A1',
+                'E1C': '#B71C1C', 'E5bQ': '#0D47A1',
+                'L1OF': '#B71C1C', 'L2OF': '#0D47A1',
+            }
             for sig in valid['sigID'].unique():
                 subset = valid[valid['sigID'] == sig]
-                c = colors.get(sig, '#1976D2')
+                c = dot_colors.get(sig, '#EF5350')
                 ax.scatter(subset['utc_parsed'], subset['atmos_doppler'], s=3, alpha=0.6, c=c, label=f'{sig}')
             
-            # Overlay polynomial fit (thick black line, respecting gaps)
+            # Overlay polynomial fit (frequency-dependent darker color, respecting gaps)
             if 'atmos_dopp_poli' in df.columns and 'timestamp' in df.columns:
                 gap_threshold = 5.0
                 for sig in valid['sigID'].unique():
@@ -2156,6 +2874,7 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
                     if sig_data.empty:
                         continue
                     
+                    lc = line_colors.get(sig, '#B71C1C')
                     timestamps = sig_data['timestamp'].values
                     time_diffs = np.diff(timestamps)
                     gap_indices = np.where(time_diffs >= gap_threshold)[0]
@@ -2163,14 +2882,19 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
                     segment_starts = np.concatenate([[0], gap_indices + 1])
                     segment_ends = np.concatenate([gap_indices + 1, [len(timestamps)]])
                     
+                    first_seg = True
                     for seg_start, seg_end in zip(segment_starts, segment_ends):
                         seg_data = sig_data.iloc[seg_start:seg_end]
                         if len(seg_data) < 2:
                             continue
-                        ax.plot(seg_data['utc_parsed'], seg_data['atmos_dopp_poli'], 'k-', linewidth=2, alpha=0.8)
+                        lbl = f'{sig} fit' if first_seg else None
+                        ax.plot(seg_data['utc_parsed'], seg_data['atmos_dopp_poli'], 
+                                color=lc, linewidth=2, alpha=0.85, label=lbl)
+                        first_seg = False
             
             ax.axhline(y=RO_DOPPLER_THRESHOLD, color='#D32F2F', linestyle='--', alpha=0.7, linewidth=1)
             ax.axhline(y=-RO_DOPPLER_THRESHOLD, color='#D32F2F', linestyle='--', alpha=0.7, linewidth=1)
+            
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
             ax.legend(fontsize=7, markerscale=2, loc='best')
     ax.set_xlabel('UTC Time'); ax.set_ylabel('Atmospheric Doppler (Hz)')
@@ -2256,14 +2980,17 @@ def get_freq_labels_from_sat_id(sat_id: str) -> tuple:
         return ('F1', 'F2')
 
 
-def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path: str, dpi: int = 150) -> bool:
+def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path: str, dpi: int = 150, station_altitude: Optional[float] = None) -> bool:
     """
-    Generate 2x2 derived profile plots.
+    Generate 2x2 derived profile plots (Panel 2).
+    
+    Subplots: Bending Angle, Refractivity, Refractivity % Error, Specific Humidity
     
     Changes from original:
     - Dynamic frequency labels based on constellation
-    - Temperature in °C (not K)
     - Bending angle in degrees (not mrad)
+    - Added Refractivity % Error and Specific Humidity panels
+    - Station height shown as upper bound on bending angle plot
     """
     try:
         import matplotlib.pyplot as plt
@@ -2271,33 +2998,44 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         return False
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Derived Atmospheric Profiles: {sat_id}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'Derived Profiles: {sat_id}', fontsize=14, fontweight='bold')
 
     # Get constellation-specific frequency labels
     freq1_label, freq2_label = get_freq_labels_from_sat_id(sat_id)
 
-    # (a) Bending Angle Profile - NOW IN DEGREES
+    # (a) Bending Angle Profile - IN DEGREES
     ax = axes[0, 0]
     bending_csv = sat_results.get('bending_csv')
     if bending_csv and os.path.exists(bending_csv):
         df = pd.read_csv(bending_csv)
+        # Use geometric tangent height if available, fall back to impact height
+        y_col = 'tangent_height_km' if 'tangent_height_km' in df.columns else 'impact_height_km'
+        y_label = 'Geometric Height, a/n − Rₑ (km)' if y_col == 'tangent_height_km' else 'Impact Height, a − Rₑ (km)'
         if 'bending_L1' in df.columns:
-            ax.plot(np.degrees(df['bending_L1']), df['tangent_height_km'], 
+            ax.plot(np.degrees(df['bending_L1']), df[y_col], 
                     'b-', linewidth=1.5, label=freq1_label, alpha=0.8)
         if 'bending_L2' in df.columns:
-            ax.plot(np.degrees(df['bending_L2']), df['tangent_height_km'], 
+            ax.plot(np.degrees(df['bending_L2']), df[y_col], 
                     'r--', linewidth=1.5, label=freq2_label, alpha=0.8)
         if 'bending_angle_rad' in df.columns:
-            ax.plot(np.degrees(df['bending_angle_rad']), df['tangent_height_km'], 
+            ax.plot(np.degrees(df['bending_angle_rad']), df[y_col], 
                     'g-', linewidth=2, label='Iono-free', alpha=0.9)
-        ax.legend(fontsize=9, loc='upper right')
+        ax.legend(fontsize=8, loc='upper right')
+    else:
+        y_label = 'Geometric Height, a/n − Rₑ (km)'
+    # Station height as upper bound for retrieved profile
+    if station_altitude is not None:
+        station_alt_km = station_altitude / 1000.0
+        ax.axhline(y=station_alt_km, color='#4CAF50', linestyle=':', linewidth=1.5, alpha=0.8,
+                   label=f'Station height ({station_alt_km:.2f} km)')
+        ax.legend(fontsize=8, loc='upper right')
     ax.set_xlabel('Bending Angle (°)')
-    ax.set_ylabel('Tangent Height (km)')
-    ax.set_title('(a) Bending Angle Profile', fontsize=11, fontweight='bold')
+    ax.set_ylabel(y_label)
+    ax.set_title('(a) Bending Angle', fontsize=11, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
 
-    # (b) Refractivity Profile - unchanged
+    # (b) Refractivity Profile
     ax = axes[0, 1]
     comp_csv, refrac_csv = sat_results.get('comp_csv'), sat_results.get('refrac_csv')
     if comp_csv and os.path.exists(comp_csv):
@@ -2310,36 +3048,129 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         ax.plot(df['refractivity_N'], df['height_km'], 'r-', linewidth=1.8, label='RO Retrieved')
         ax.legend(fontsize=9, loc='upper right')
     ax.set_xlabel('Refractivity (N-units)')
-    ax.set_ylabel('Height (km)')
-    ax.set_title('(b) Refractivity Profile', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(b) Refractivity', fontsize=11, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
 
-    # (c) Pressure Profiles - unchanged
+    # (c) Refractivity % Error
     ax = axes[1, 0]
+    if comp_csv and os.path.exists(comp_csv):
+        df = pd.read_csv(comp_csv)
+        if 'N_RO' in df.columns and 'N_ERA5' in df.columns:
+            pct_error = ((df['N_RO'] - df['N_ERA5']) / df['N_ERA5']) * 100
+            ax.plot(pct_error, df['height_km'], 'm-', linewidth=1.5, label='% Error')
+            ax.axvline(x=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
+            ax.legend(fontsize=9, loc='upper right')
+    else:
+        ax.text(0.5, 0.5, 'Requires ERA5\ncomparison data', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+    ax.set_xlabel('Refractivity Error (%)')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(c) Refractivity % Error', fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+
+    # (d) Specific Humidity
+    ax = axes[1, 1]
     atm_csv = sat_results.get('atm_csv')
+    if atm_csv and os.path.exists(atm_csv):
+        df = pd.read_csv(atm_csv)
+        if 'specific_humidity_g_kg' in df.columns:
+            ax.plot(df['specific_humidity_g_kg'], df['height_km'], 'c-', linewidth=1.5, label='q (RO)')
+        if 'q_era5' in df.columns:
+            ax.plot(df['q_era5'], df['height_km'], 'c--', linewidth=1, alpha=0.6, label='q (ERA5)')
+        ax.legend(fontsize=9, loc='upper right')
+    else:
+        ax.text(0.5, 0.5, 'Requires atmospheric\nretrieval data', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+    ax.set_xlabel('Specific Humidity (g/kg)')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(d) Specific Humidity', fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    return True
+
+
+def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_path: str, dpi: int = 150) -> bool:
+    """
+    Generate 2x2 atmospheric retrieval plots (Panel 3).
+    
+    Subplots: Pressure, Water Vapor Pressure, Relative Humidity, Temperature (ERA5)
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return False
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f'Atmospheric Profiles: {sat_id}', fontsize=14, fontweight='bold')
+
+    atm_csv = sat_results.get('atm_csv')
+
+    # (a) Pressure Profile
+    ax = axes[0, 0]
     if atm_csv and os.path.exists(atm_csv):
         df = pd.read_csv(atm_csv)
         if 'pressure_hPa' in df.columns:
             ax.plot(df['pressure_hPa'], df['height_km'], 'r-', linewidth=1.5, label='P (RO)')
         if 'P_era5' in df.columns:
             ax.plot(df['P_era5'], df['height_km'], 'r--', linewidth=1, alpha=0.6, label='P (ERA5)')
+        ax.legend(fontsize=9, loc='upper right')
+    ax.set_xlabel('Pressure (hPa)')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(a) Pressure', fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+
+    # (b) Water Vapor Pressure Profile
+    ax = axes[0, 1]
+    if atm_csv and os.path.exists(atm_csv):
+        df = pd.read_csv(atm_csv)
         if 'water_vapor_hPa' in df.columns:
             ax.plot(df['water_vapor_hPa'], df['height_km'], 'b-', linewidth=1.5, label='Pw (RO)')
         if 'Pw_era5' in df.columns:
             ax.plot(df['Pw_era5'], df['height_km'], 'b--', linewidth=1, alpha=0.6, label='Pw (ERA5)')
-        ax.legend(fontsize=8, loc='upper right')
-    ax.set_xlabel('Pressure (hPa)')
-    ax.set_ylabel('Height (km)')
-    ax.set_title('(c) Pressure Profiles (P, Pw)', fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9, loc='upper right')
+    ax.set_xlabel('Water Vapor Pressure (hPa)')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(b) Water Vapor Pressure', fontsize=11, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
-    # (d) Temperature Profile - NOW IN CELSIUS
+    # (c) Relative Humidity (computed from Pw and T)
+    ax = axes[1, 0]
+    if atm_csv and os.path.exists(atm_csv):
+        df = pd.read_csv(atm_csv)
+        if 'water_vapor_hPa' in df.columns and 'T_era5' in df.columns:
+            T_c = df['T_era5'] - 273.15
+            Ps = 6.1094 * np.exp(17.625 * T_c / (T_c + 243.04))
+            RH_ro = (df['water_vapor_hPa'] / Ps) * 100
+            RH_ro = RH_ro.clip(0, 100)
+            ax.plot(RH_ro, df['height_km'], '#8E24AA', linewidth=1.5, label='RH (RO)')
+            if 'Pw_era5' in df.columns:
+                RH_era5 = (df['Pw_era5'] / Ps) * 100
+                RH_era5 = RH_era5.clip(0, 100)
+                ax.plot(RH_era5, df['height_km'], color='#8E24AA', linestyle='--', 
+                        linewidth=1, alpha=0.6, label='RH (ERA5)')
+            ax.legend(fontsize=9, loc='upper right')
+        else:
+            ax.text(0.5, 0.5, 'Requires Pw and T\ndata for RH', 
+                    ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+    else:
+        ax.text(0.5, 0.5, 'Requires atmospheric\nretrieval data', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+    ax.set_xlabel('Relative Humidity (%)')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(c) Relative Humidity', fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+
+    # (d) Temperature Profile - IN CELSIUS
     ax = axes[1, 1]
     if atm_csv and os.path.exists(atm_csv):
         df = pd.read_csv(atm_csv)
         if 'T_era5' in df.columns:
-            # Convert K to Celsius
             temp_celsius = df['T_era5'] - 273.15
             ax.plot(temp_celsius, df['height_km'], 'g-', linewidth=1.8, label='T (ERA5)')
             ax.legend(fontsize=9, loc='upper right')
@@ -2350,8 +3181,8 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         ax.text(0.5, 0.5, 'Requires ERA5 data', 
                 ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
     ax.set_xlabel('Temperature (°C)')
-    ax.set_ylabel('Height (km)')
-    ax.set_title('(d) Temperature Profile', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
+    ax.set_title('(d) Temperature (ERA5)', fontsize=11, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
