@@ -1,5 +1,4 @@
 name: Build GNSS-RO Application
-
 on:
   push:
     tags:
@@ -32,11 +31,11 @@ jobs:
             --name "GNSS-RO" \
             --osx-bundle-identifier "com.gnssro.app" \
             --add-data "assets:assets" \
-            --add-data "login_ui.py:." \
-            --add-data "qt_compat.py:." \
-            --add-data "ground_gnss_ro_pipeline.py:." \
-            --add-data "sat_gnss_ro_pipeline.py:." \
-            --add-data "rinex_parser.py:." \
+            --hidden-import "qt_compat" \
+            --hidden-import "login_ui" \
+            --hidden-import "ground_gnss_ro_pipeline" \
+            --hidden-import "sat_gnss_ro_pipeline" \
+            --hidden-import "rinex_parser" \
             --hidden-import "PyQt6.QtWidgets" \
             --hidden-import "PyQt6.QtCore" \
             --hidden-import "PyQt6.QtGui" \
@@ -61,13 +60,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Python 3.8 is the last version supporting Windows 7
+      # -----------------------------------------------------------------------
+      # Python 3.8 is the last CPython release with official Windows 7 support.
+      # (Python 3.9+ requires Windows 8+.)
+      # -----------------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.8'
 
-      # Pinned versions with Python 3.8 wheels for Windows 7 compatibility
+      # -----------------------------------------------------------------------
+      # Pinned package versions that ship Python 3.8 wheels and are known to
+      # work on Windows 7 SP1 (no updates since 2020) and Windows 10 LTSC 2019.
+      #
+      # PyQt6 requires Windows 10+ — we use PyQt5 for the Windows build.
+      # qt_compat.py already handles the PyQt5/PyQt6 fallback transparently.
+      # -----------------------------------------------------------------------
       - name: Install dependencies
         run: |
           pip install --upgrade pip
@@ -80,6 +88,25 @@ jobs:
           pip install netCDF4==1.6.5
           pip install xarray==2023.1.0
 
+      # -----------------------------------------------------------------------
+      # Key changes vs the broken build:
+      #
+      # 1. qt_compat, login_ui, ground_gnss_ro_pipeline, sat_gnss_ro_pipeline,
+      #    and rinex_parser are Python MODULES → use --hidden-import, NOT
+      #    --add-data.  --add-data copies raw bytes into _MEIPASS but does NOT
+      #    make them importable; --hidden-import tells PyInstaller to compile
+      #    and bundle them as proper .pyc entries on sys.path.
+      #
+      # 2. gnss_ro_gui.py itself now injects sys._MEIPASS into sys.path[0]
+      #    when frozen, so every subsequent local import resolves correctly
+      #    even on edge-case Windows builds where PyInstaller's automatic
+      #    path wiring is incomplete.
+      #
+      # 3. matplotlib backend is backend_qt5agg (matching PyQt5).
+      #
+      # 4. assets/ is still --add-data because those are data files, not
+      #    Python modules (semicolon separator = Windows convention).
+      # -----------------------------------------------------------------------
       - name: Build Windows exe
         run: |
           pyinstaller `
@@ -87,11 +114,11 @@ jobs:
             --windowed `
             --name "GNSS-RO" `
             --add-data "assets;assets" `
-            --add-data "login_ui.py;." `
-            --add-data "qt_compat.py;." `
-            --add-data "ground_gnss_ro_pipeline.py;." `
-            --add-data "sat_gnss_ro_pipeline.py;." `
-            --add-data "rinex_parser.py;." `
+            --hidden-import "qt_compat" `
+            --hidden-import "login_ui" `
+            --hidden-import "ground_gnss_ro_pipeline" `
+            --hidden-import "sat_gnss_ro_pipeline" `
+            --hidden-import "rinex_parser" `
             --hidden-import "PyQt5.QtWidgets" `
             --hidden-import "PyQt5.QtCore" `
             --hidden-import "PyQt5.QtGui" `
@@ -132,3 +159,4 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

@@ -7,7 +7,9 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
         QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
-        QSplitter, QMessageBox, QDialog, QGraphicsDropShadowEffect
+        QSplitter, QMessageBox, QDialog, QGraphicsDropShadowEffect,
+        QCheckBox, QFormLayout, QDoubleSpinBox, QSpinBox, QScrollArea,
+        QToolButton, QSizePolicy, QFrame
     )
     from PyQt6.QtCore import (
         Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint
@@ -23,7 +25,9 @@ except ImportError:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
         QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
-        QSplitter, QMessageBox, QDialog, QGraphicsDropShadowEffect
+        QSplitter, QMessageBox, QDialog, QGraphicsDropShadowEffect,
+        QCheckBox, QFormLayout, QDoubleSpinBox, QSpinBox, QScrollArea,
+        QToolButton, QSizePolicy, QFrame
     )
     from PyQt5.QtCore import (
         Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint

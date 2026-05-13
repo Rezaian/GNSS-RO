@@ -1,5 +1,5 @@
 """
-GNSS Radio Occultation Processing Pipeline v3.3.2
+GNSS Radio Occultation Processing Pipeline v3.4.4.2
 ================================================
 
 Pipeline Steps:
@@ -201,9 +201,81 @@ N_COEFF_A2 = 3.73e5
 
 RO_ELEVATION_THRESHOLD = 5.0
 RO_DOPPLER_THRESHOLD = 1
-RO_MIN_EPOCHS = 10
+RO_MIN_EPOCHS = 25  # v3.4.4: raised from 10
 
 POLYNOMIAL_WINDOW = 150 #(seconds, for a 50Hz sampling be 150/50 = 3)
+
+# Polyfit segmentation: gap (sec) above which the rolling polynomial fit restarts.
+POLYFIT_GAP_THRESHOLD = 5.0
+
+# ----------------------------------------------------------------------------
+# v3.4.4 — Configurable processing constants exposed via the .cra "PROCESSING" key.
+# Anything the user puts under "PROCESSING" overrides the corresponding default
+# below. Missing keys fall back to the defaults — i.e. the .cra is additive.
+# ----------------------------------------------------------------------------
+PROCESSING_DEFAULTS = {
+    # Smoothing
+    'POLY_SMOOTH_WINDOW': 150,        # Polynomial smoothing window (sec). 50Hz→3s effective.
+    'POLYFIT_GAP_THRESHOLD': 5.0,     # Restart polyfit when gap >= this many seconds.
+
+    # RO detection
+    'RO_ELEVATION_THRESHOLD': 5.0,    # deg
+    'RO_DOPPLER_THRESHOLD': 1.0,      # Hz
+    'RO_MIN_EPOCHS': 25,              # Minimum RO epochs for a valid event.
+
+    # Reference satellite selection (kept for forward compatibility w/ ref-rework)
+    'REF_SAT_ELEVATION_THRESHOLD': 50.0,
+    'REF_SAT_MIN_EPOCHS': 100,
+    'REF_SAT_JUMP_THRESHOLD': 2.0,
+
+    # Smith-Weintraub refractivity coefficients
+    'N_COEFF_A1': 77.6,
+    'N_COEFF_A2': 3.73e5,
+
+    # Pipeline behaviour
+    'KEEP_INTERMEDIATE_CSVS': False,   # If true, keep step1/step2/step3 CSVs after run.
+    'FORCE_CRA_STATION_COORDS': False, # If true, use .cra station coords even if RINEX has APPROX POSITION XYZ.
+}
+
+
+def load_processing_config_from_cra(cra_data: Optional[Dict]) -> Dict:
+    """
+    Extract the PROCESSING section from a parsed .cra dict and merge over
+    PROCESSING_DEFAULTS. Returns a complete config dict.
+
+    Unknown keys in the user's PROCESSING block are kept (forward compat),
+    missing keys fall through to defaults.
+    """
+    cfg = dict(PROCESSING_DEFAULTS)
+    if not cra_data:
+        return cfg
+    user_proc = cra_data.get('PROCESSING') or {}
+    if not isinstance(user_proc, dict):
+        return cfg
+    for k, v in user_proc.items():
+        cfg[k] = v
+    return cfg
+
+
+def apply_processing_config(cfg: Dict) -> None:
+    """
+    Apply a processing config dict to the module-level constants so the rest
+    of the pipeline picks them up. Safe to call multiple times.
+    """
+    global RO_ELEVATION_THRESHOLD, RO_DOPPLER_THRESHOLD, RO_MIN_EPOCHS
+    global POLYNOMIAL_WINDOW, POLYFIT_GAP_THRESHOLD
+    global N_COEFF_A1, N_COEFF_A2
+
+    if not cfg:
+        return
+
+    RO_ELEVATION_THRESHOLD = float(cfg.get('RO_ELEVATION_THRESHOLD', RO_ELEVATION_THRESHOLD))
+    RO_DOPPLER_THRESHOLD   = float(cfg.get('RO_DOPPLER_THRESHOLD', RO_DOPPLER_THRESHOLD))
+    RO_MIN_EPOCHS          = int(cfg.get('RO_MIN_EPOCHS', RO_MIN_EPOCHS))
+    POLYNOMIAL_WINDOW      = float(cfg.get('POLY_SMOOTH_WINDOW', POLYNOMIAL_WINDOW))
+    POLYFIT_GAP_THRESHOLD  = float(cfg.get('POLYFIT_GAP_THRESHOLD', POLYFIT_GAP_THRESHOLD))
+    N_COEFF_A1             = float(cfg.get('N_COEFF_A1', N_COEFF_A1))
+    N_COEFF_A2             = float(cfg.get('N_COEFF_A2', N_COEFF_A2))
 
 
 def infer_signal_frequency(sig_id: str, gnss_id: str = None) -> Optional[float]:
@@ -460,12 +532,26 @@ def compute_gravity(h_m: float, lat_deg: Optional[float] = None) -> float:
 
 def evaluate_ro_status(
     sat_data: pd.DataFrame,
-    elevation_threshold: float = RO_ELEVATION_THRESHOLD,
-    doppler_threshold: float = RO_DOPPLER_THRESHOLD,
-    min_epochs: int = RO_MIN_EPOCHS,
-    min_dual_freq_epochs: int = RO_MIN_EPOCHS
+    elevation_threshold: Optional[float] = None,
+    doppler_threshold: Optional[float] = None,
+    min_epochs: Optional[int] = None,
+    min_dual_freq_epochs: Optional[int] = None
 ) -> Dict[str, bool]:
-    """Evaluate RO status for each satellite."""
+    """Evaluate RO status for each satellite.
+
+    v3.4.4: thresholds default to live module-level values so .cra-overridden
+    PROCESSING values take effect downstream.
+    """
+    # Resolve live so .cra overrides apply at call time.
+    if elevation_threshold is None:
+        elevation_threshold = RO_ELEVATION_THRESHOLD
+    if doppler_threshold is None:
+        doppler_threshold = RO_DOPPLER_THRESHOLD
+    if min_epochs is None:
+        min_epochs = RO_MIN_EPOCHS
+    if min_dual_freq_epochs is None:
+        min_dual_freq_epochs = RO_MIN_EPOCHS
+
     ro_status = {}
     
     if sat_data.empty:
@@ -1897,10 +1983,13 @@ def _compute_weighted_reference(
     
     return weighted_doppler, sat_list
     
-def apply_fresnel_polynomial_smoothing(df: pd.DataFrame, fresnel_window_sec: float = POLYNOMIAL_WINDOW) -> pd.DataFrame:
+def apply_fresnel_polynomial_smoothing(df: pd.DataFrame, fresnel_window_sec: float = None) -> pd.DataFrame:
     """
     Apply 2nd-order polynomial fit to atmos_doppler over Fresnel time window.
-    Takes value at center of window. Respects gaps >= 5 seconds.
+    Takes value at center of window. Respects gaps >= POLYFIT_GAP_THRESHOLD seconds.
+
+    v3.4.4: window and gap threshold are read live from module-level constants
+    so .cra overrides take effect. Pass fresnel_window_sec to override per-call.
     """
     df = df.copy()
     df['atmos_dopp_poli'] = np.nan
@@ -1908,7 +1997,10 @@ def apply_fresnel_polynomial_smoothing(df: pd.DataFrame, fresnel_window_sec: flo
     if 'atmos_doppler' not in df.columns or 'timestamp' not in df.columns:
         return df
     
-    gap_threshold = 5.0
+    # Read live so .cra-overridden values are respected.
+    if fresnel_window_sec is None:
+        fresnel_window_sec = POLYNOMIAL_WINDOW
+    gap_threshold = POLYFIT_GAP_THRESHOLD
     half_window = fresnel_window_sec / 2.0
     
     for (sat_id, sig_id), group in df.groupby(['sat_id', 'sigID'] if 'sat_id' in df.columns else ['gnssId', 'svId', 'sigID']):
@@ -3000,6 +3092,11 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     fig.suptitle(f'Derived Profiles: {sat_id}', fontsize=14, fontweight='bold')
 
+    # v3.4.4: scatter (not line) for retrieved profiles — line plots in height
+    # space connect outliers and visually corrupt the panel. Markers leave
+    # outliers isolated and easy to spot.
+    sct_kw = dict(s=8, alpha=0.7, edgecolors='none')
+
     # Get constellation-specific frequency labels
     freq1_label, freq2_label = get_freq_labels_from_sat_id(sat_id)
 
@@ -3012,14 +3109,14 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         y_col = 'tangent_height_km' if 'tangent_height_km' in df.columns else 'impact_height_km'
         y_label = 'Geometric Height, a/n − Rₑ (km)' if y_col == 'tangent_height_km' else 'Impact Height, a − Rₑ (km)'
         if 'bending_L1' in df.columns:
-            ax.plot(np.degrees(df['bending_L1']), df[y_col], 
-                    'b-', linewidth=1.5, label=freq1_label, alpha=0.8)
+            ax.scatter(np.degrees(df['bending_L1']), df[y_col],
+                       c='b', label=freq1_label, **sct_kw)
         if 'bending_L2' in df.columns:
-            ax.plot(np.degrees(df['bending_L2']), df[y_col], 
-                    'r--', linewidth=1.5, label=freq2_label, alpha=0.8)
+            ax.scatter(np.degrees(df['bending_L2']), df[y_col],
+                       c='r', marker='x', label=freq2_label, s=10, alpha=0.7)
         if 'bending_angle_rad' in df.columns:
-            ax.plot(np.degrees(df['bending_angle_rad']), df[y_col], 
-                    'g-', linewidth=2, label='Iono-free', alpha=0.9)
+            ax.scatter(np.degrees(df['bending_angle_rad']), df[y_col],
+                       c='g', label='Iono-free', **sct_kw)
         ax.legend(fontsize=8, loc='upper right')
     else:
         y_label = 'Geometric Height, a/n − Rₑ (km)'
@@ -3040,12 +3137,12 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
     comp_csv, refrac_csv = sat_results.get('comp_csv'), sat_results.get('refrac_csv')
     if comp_csv and os.path.exists(comp_csv):
         df = pd.read_csv(comp_csv)
-        ax.plot(df['N_RO'], df['height_km'], 'r-', linewidth=1.8, label='RO Retrieved')
-        ax.plot(df['N_ERA5'], df['height_km'], 'b--', linewidth=1.5, label='ERA5')
+        ax.scatter(df['N_RO'], df['height_km'], c='r', label='RO Retrieved', **sct_kw)
+        ax.scatter(df['N_ERA5'], df['height_km'], c='b', marker='x', s=10, alpha=0.7, label='ERA5')
         ax.legend(fontsize=9, loc='upper right')
     elif refrac_csv and os.path.exists(refrac_csv):
         df = pd.read_csv(refrac_csv)
-        ax.plot(df['refractivity_N'], df['height_km'], 'r-', linewidth=1.8, label='RO Retrieved')
+        ax.scatter(df['refractivity_N'], df['height_km'], c='r', label='RO Retrieved', **sct_kw)
         ax.legend(fontsize=9, loc='upper right')
     ax.set_xlabel('Refractivity (N-units)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
@@ -3059,11 +3156,11 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         df = pd.read_csv(comp_csv)
         if 'N_RO' in df.columns and 'N_ERA5' in df.columns:
             pct_error = ((df['N_RO'] - df['N_ERA5']) / df['N_ERA5']) * 100
-            ax.plot(pct_error, df['height_km'], 'm-', linewidth=1.5, label='% Error')
+            ax.scatter(pct_error, df['height_km'], c='m', label='% Error', **sct_kw)
             ax.axvline(x=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
             ax.legend(fontsize=9, loc='upper right')
     else:
-        ax.text(0.5, 0.5, 'Requires ERA5\ncomparison data', 
+        ax.text(0.5, 0.5, 'Requires ERA5\ncomparison data',
                 ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
     ax.set_xlabel('Refractivity Error (%)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
@@ -3076,12 +3173,12 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
     if atm_csv and os.path.exists(atm_csv):
         df = pd.read_csv(atm_csv)
         if 'specific_humidity_g_kg' in df.columns:
-            ax.plot(df['specific_humidity_g_kg'], df['height_km'], 'c-', linewidth=1.5, label='q (RO)')
+            ax.scatter(df['specific_humidity_g_kg'], df['height_km'], c='c', label='q (RO)', **sct_kw)
         if 'q_era5' in df.columns:
-            ax.plot(df['q_era5'], df['height_km'], 'c--', linewidth=1, alpha=0.6, label='q (ERA5)')
+            ax.scatter(df['q_era5'], df['height_km'], c='c', marker='x', s=10, alpha=0.6, label='q (ERA5)')
         ax.legend(fontsize=9, loc='upper right')
     else:
-        ax.text(0.5, 0.5, 'Requires atmospheric\nretrieval data', 
+        ax.text(0.5, 0.5, 'Requires atmospheric\nretrieval data',
                 ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
     ax.set_xlabel('Specific Humidity (g/kg)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
@@ -3109,6 +3206,9 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     fig.suptitle(f'Atmospheric Profiles: {sat_id}', fontsize=14, fontweight='bold')
 
+    # v3.4.4: scatter (not line) for retrieved profiles.
+    sct_kw = dict(s=8, alpha=0.7, edgecolors='none')
+
     atm_csv = sat_results.get('atm_csv')
 
     # (a) Pressure Profile
@@ -3116,9 +3216,9 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
     if atm_csv and os.path.exists(atm_csv):
         df = pd.read_csv(atm_csv)
         if 'pressure_hPa' in df.columns:
-            ax.plot(df['pressure_hPa'], df['height_km'], 'r-', linewidth=1.5, label='P (RO)')
+            ax.scatter(df['pressure_hPa'], df['height_km'], c='r', label='P (RO)', **sct_kw)
         if 'P_era5' in df.columns:
-            ax.plot(df['P_era5'], df['height_km'], 'r--', linewidth=1, alpha=0.6, label='P (ERA5)')
+            ax.scatter(df['P_era5'], df['height_km'], c='r', marker='x', s=10, alpha=0.6, label='P (ERA5)')
         ax.legend(fontsize=9, loc='upper right')
     ax.set_xlabel('Pressure (hPa)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
@@ -3130,9 +3230,9 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
     if atm_csv and os.path.exists(atm_csv):
         df = pd.read_csv(atm_csv)
         if 'water_vapor_hPa' in df.columns:
-            ax.plot(df['water_vapor_hPa'], df['height_km'], 'b-', linewidth=1.5, label='Pw (RO)')
+            ax.scatter(df['water_vapor_hPa'], df['height_km'], c='b', label='Pw (RO)', **sct_kw)
         if 'Pw_era5' in df.columns:
-            ax.plot(df['Pw_era5'], df['height_km'], 'b--', linewidth=1, alpha=0.6, label='Pw (ERA5)')
+            ax.scatter(df['Pw_era5'], df['height_km'], c='b', marker='x', s=10, alpha=0.6, label='Pw (ERA5)')
         ax.legend(fontsize=9, loc='upper right')
     ax.set_xlabel('Water Vapor Pressure (hPa)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
@@ -3148,12 +3248,12 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
             Ps = 6.1094 * np.exp(17.625 * T_c / (T_c + 243.04))
             RH_ro = (df['water_vapor_hPa'] / Ps) * 100
             RH_ro = RH_ro.clip(0, 100)
-            ax.plot(RH_ro, df['height_km'], '#8E24AA', linewidth=1.5, label='RH (RO)')
+            ax.scatter(RH_ro, df['height_km'], c='#8E24AA', label='RH (RO)', **sct_kw)
             if 'Pw_era5' in df.columns:
                 RH_era5 = (df['Pw_era5'] / Ps) * 100
                 RH_era5 = RH_era5.clip(0, 100)
-                ax.plot(RH_era5, df['height_km'], color='#8E24AA', linestyle='--', 
-                        linewidth=1, alpha=0.6, label='RH (ERA5)')
+                ax.scatter(RH_era5, df['height_km'], c='#8E24AA', marker='x',
+                           s=10, alpha=0.6, label='RH (ERA5)')
             ax.legend(fontsize=9, loc='upper right')
         else:
             ax.text(0.5, 0.5, 'Requires Pw and T\ndata for RH', 
@@ -3172,7 +3272,7 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
         df = pd.read_csv(atm_csv)
         if 'T_era5' in df.columns:
             temp_celsius = df['T_era5'] - 273.15
-            ax.plot(temp_celsius, df['height_km'], 'g-', linewidth=1.8, label='T (ERA5)')
+            ax.scatter(temp_celsius, df['height_km'], c='g', label='T (ERA5)', **sct_kw)
             ax.legend(fontsize=9, loc='upper right')
         else:
             ax.text(0.5, 0.5, 'Temperature data\nnot available', 
