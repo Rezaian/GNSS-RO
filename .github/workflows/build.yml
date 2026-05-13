@@ -150,13 +150,15 @@ jobs:
           path: windows
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             macos/GNSS-RO-macOS.zip
             windows/GNSS-RO.exe
           draft: false
           prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
