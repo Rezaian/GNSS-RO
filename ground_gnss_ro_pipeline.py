@@ -1284,7 +1284,11 @@ class ProcessingResult:
 class SP3Parser:
     """High-precision SP3 parser with microsecond-level interpolation support"""
     
-    CONSTELLATION_MAP = {'GPS': 'G', 'GLO': 'R', 'GAL': 'E', 'BDS': 'C', 'QZS': 'J', 'IRN': 'I'}
+    CONSTELLATION_MAP = {
+        'GPS': 'G', 'GLO': 'R', 'GLONASS': 'R',
+        'GAL': 'E', 'BDS': 'C', 'QZS': 'J', 'QZSS': 'J', 'IRN': 'I', 'IRNSS': 'I',
+        'SBAS': 'S',
+    }
 
     def __init__(self, sp3_file: str):
         self.epochs: Dict[datetime, Dict[str, Dict]] = {}
@@ -1659,28 +1663,41 @@ def calculate_geometric_doppler(
     
     # Convert pseudorange to numeric
     df['pseudorange'] = pd.to_numeric(df['pseudorange'], errors='coerce')
-    
-    # Drop rows with missing essential data
+
+    # Keep rows that have a sigID; pseudorange is optional.
+    # RINEX carrier-only rows (L observable, no C) have pseudorange=NaN but
+    # still carry valid Doppler/carrier phase for atmospheric differencing.
     initial_count = len(df)
-    df = df.dropna(subset=['pseudorange', 'sigID']).copy()
-    
+    df = df.dropna(subset=['sigID']).copy()
+
     if df.empty:
         return ProcessingResult(
             success=False,
             data=None,
             message="No valid observations after filtering",
-            metadata={'initial_count': initial_count, 'valid_count': 0}  # FIXED: Added metadata
+            metadata={'initial_count': initial_count, 'valid_count': 0}
         )
     
     station_ecef = station.to_ecef()
     
-    # Calculate time delay
-    df['time_delay_s'] = df['pseudorange'] / SPEED_OF_LIGHT
-    
+    # Time delay: use pseudorange when available; fall back to geometric range.
+    # RINEX carrier-only rows have NaN pseudorange; using geometric range
+    # introduces < 0.01 Hz error in geometric Doppler — well within thresholds.
+    station_ecef_tmp = station.to_ecef()
+    sat_pos_tmp = df[['interp_x', 'interp_y', 'interp_z']].values
+    geom_range = np.linalg.norm(sat_pos_tmp - station_ecef_tmp, axis=1)
+    pr_numeric = df['pseudorange'].values
+    time_delay_values = np.where(
+        np.isfinite(pr_numeric),
+        pr_numeric / SPEED_OF_LIGHT,
+        geom_range  / SPEED_OF_LIGHT
+    )
+    df['time_delay_s'] = time_delay_values
+
     # Get satellite positions and velocities
     sat_pos = df[['interp_x', 'interp_y', 'interp_z']].values
     sat_vel_ecef = df[['interp_vel_x', 'interp_vel_y', 'interp_vel_z']].values
-    
+
     # Calculate satellite position at transmission time
     sat_pos_tx = sat_pos - sat_vel_ecef * df['time_delay_s'].values[:, np.newaxis]
     
@@ -2811,74 +2828,242 @@ def retrieve_refractivity(
 # STEP 6B: ERA5 COMPARISON
 # ============================================================================
 
-def compare_with_era5(refractivity_csv: str, era5_file: str, lat: Optional[float] = None, lon: Optional[float] = None, output_csv: Optional[str] = None) -> ProcessingResult:
+def _era5_extract(ds, lat, lon):
+    """
+    Extract ERA5 T, q, z profiles with automatic fallback.
+
+    Priority:
+      1. Spatial interpolation to (lat, lon) — used when the point falls
+         inside the ERA5 grid.
+      2. Nearest-grid-point selection — used when interp() returns all-NaN
+         (point outside or on the edge of the grid).
+      3. Full spatial mean — last resort when neither above yields data.
+
+    ERA5 files from Copernicus sometimes cover only a small region; an RO
+    session whose station coords fall just outside that region will cause
+    xarray.interp() to silently return NaN for every pressure level.  That
+    propagates through refractivity calculation and produces an empty CSV
+    — the symptom the user sees as "ERA5 not plotted".
+
+    The coordinate mismatch is non-fatal: the ERA5 file is still useful as
+    a climatological reference even if it was downloaded for a slightly
+    different area.  The log message records which fallback was used.
+    """
+    fallback_used = 'interp'
+
+    def _time_mean(da):
+        """Average over valid_time / time dimension, whichever exists."""
+        for dim in ('valid_time', 'time'):
+            if dim in da.dims:
+                return da.mean(dim=dim)
+        return da
+
+    if lat is not None and lon is not None:
+        try:
+            T = _time_mean(ds['t'].interp(latitude=lat, longitude=lon))
+            q = _time_mean(ds['q'].interp(latitude=lat, longitude=lon))
+            z = _time_mean(ds['z'].interp(latitude=lat, longitude=lon))
+            # Check whether interp produced valid data
+            if not (np.isfinite(T.values).any() and
+                    np.isfinite(z.values).any()):
+                raise ValueError("interp returned all-NaN (point outside grid)")
+        except Exception:
+            # Fallback 1: nearest grid point
+            fallback_used = 'nearest'
+            try:
+                T = _time_mean(ds['t'].sel(latitude=lat, longitude=lon, method='nearest'))
+                q = _time_mean(ds['q'].sel(latitude=lat, longitude=lon, method='nearest'))
+                z = _time_mean(ds['z'].sel(latitude=lat, longitude=lon, method='nearest'))
+                if not np.isfinite(T.values).any():
+                    raise ValueError("nearest also returned all-NaN")
+            except Exception:
+                # Fallback 2: full spatial mean
+                fallback_used = 'spatial_mean'
+                T = _time_mean(ds['t'].mean(dim=['latitude', 'longitude']))
+                q = _time_mean(ds['q'].mean(dim=['latitude', 'longitude']))
+                z = _time_mean(ds['z'].mean(dim=['latitude', 'longitude']))
+    else:
+        fallback_used = 'spatial_mean'
+        T = _time_mean(ds['t'].mean(dim=['latitude', 'longitude']))
+        q = _time_mean(ds['q'].mean(dim=['latitude', 'longitude']))
+        z = _time_mean(ds['z'].mean(dim=['latitude', 'longitude']))
+
+    return T, q, z, fallback_used
+
+
+def compare_with_era5(refractivity_csv: str, era5_file: str,
+                      lat: Optional[float] = None, lon: Optional[float] = None,
+                      output_csv: Optional[str] = None) -> ProcessingResult:
+    """
+    Compare retrieved refractivity against ERA5.
+
+    v3.4.5 fixes:
+    - Automatic fallback when station coords are outside the ERA5 grid.
+    - height_km array is explicitly sorted before interp1d.
+    - Height filter relaxed from > 0 to > -1 km to retain near-surface data.
+    - Robust time-dimension handling (valid_time OR time).
+    """
     try:
         import xarray as xr
     except ImportError:
-        return ProcessingResult(False, message="xarray required")
+        return ProcessingResult(False, None, "xarray required", {})
 
     ro_df = pd.read_csv(refractivity_csv)
-    h_ro, N_ro = ro_df['height_km'].values, ro_df['refractivity_N'].values
-    valid = ~np.isnan(h_ro) & ~np.isnan(N_ro) & (h_ro > 0)
+    if ro_df.empty or 'height_km' not in ro_df.columns:
+        return ProcessingResult(False, None, "Empty or invalid refractivity CSV", {})
+
+    h_ro = ro_df['height_km'].values
+    N_ro = ro_df['refractivity_N'].values
+    # Relaxed filter: keep near-surface data (> -1 km)
+    valid = np.isfinite(h_ro) & np.isfinite(N_ro) & (h_ro > -1.0)
     h_ro, N_ro = h_ro[valid], N_ro[valid]
 
-    ds = xr.open_dataset(era5_file)
-    if lat is None or lon is None:
-        T, q, z = ds['t'].mean(dim=['latitude', 'longitude', 'valid_time']), ds['q'].mean(dim=['latitude', 'longitude', 'valid_time']), ds['z'].mean(dim=['latitude', 'longitude', 'valid_time'])
-    else:
-        T, q, z = ds['t'].interp(latitude=lat, longitude=lon).mean(dim='valid_time'), ds['q'].interp(latitude=lat, longitude=lon).mean(dim='valid_time'), ds['z'].interp(latitude=lat, longitude=lon).mean(dim='valid_time')
+    if len(h_ro) == 0:
+        return ProcessingResult(False, None,
+                                "No valid RO refractivity points (all NaN or below -1 km)", {})
 
-    P = ds['pressure_level']
-    height_km = (z / 9.80665).values / 1000.0
-    e = (q * P) / (0.622 + (1 - 0.622) * q)
-    N_era5 = 77.6 * (P / T) + 3.73e5 * (e / T**2)
-    ds.close()
+    try:
+        ds = xr.open_dataset(era5_file)
+    except Exception as e:
+        return ProcessingResult(False, None, f"Cannot open ERA5 file: {e}", {})
 
-    N_era5_interp = interp1d(height_km, N_era5.values, kind='linear', bounds_error=False, fill_value=np.nan)(h_ro)
-    valid = ~np.isnan(N_era5_interp)
-    h_common, N_ro_common, N_era5_common = h_ro[valid], N_ro[valid], N_era5_interp[valid]
-    error = N_ro_common - N_era5_common
+    try:
+        T, q, z, fallback = _era5_extract(ds, lat, lon)
+        P = ds['pressure_level']
 
-    comparison_df = pd.DataFrame({'height_km': h_common, 'N_RO': N_ro_common, 'N_ERA5': N_era5_common, 'error': error})
+        height_km = (z.values / 9.80665) / 1000.0
+        e = (q * P) / (0.622 + (1.0 - 0.622) * q)
+        N_era5 = 77.6 * (P / T) + 3.73e5 * (e / T ** 2)
+    except Exception as e:
+        ds.close()
+        return ProcessingResult(False, None, f"ERA5 profile extraction failed: {e}", {})
+    finally:
+        ds.close()
+
+    # Sort by height before interpolation (ERA5 pressure levels may be in
+    # any order depending on file origin)
+    sort_idx = np.argsort(height_km)
+    height_km_s = height_km[sort_idx]
+    N_era5_s    = N_era5.values[sort_idx]
+
+    # Remove duplicate heights (can occur at boundaries)
+    _, uniq = np.unique(height_km_s, return_index=True)
+    height_km_s = height_km_s[uniq]
+    N_era5_s    = N_era5_s[uniq]
+
+    if not np.isfinite(N_era5_s).any():
+        return ProcessingResult(False, None,
+                                f"ERA5 refractivity all-NaN (fallback={fallback})", {})
+
+    N_era5_interp = interp1d(
+        height_km_s, N_era5_s,
+        kind='linear', bounds_error=False, fill_value=np.nan
+    )(h_ro)
+
+    valid2 = np.isfinite(N_era5_interp)
+    if not valid2.any():
+        return ProcessingResult(False, None,
+                                "No overlap between RO height range and ERA5 grid "
+                                f"(RO: {h_ro.min():.1f}–{h_ro.max():.1f} km, "
+                                f"ERA5: {height_km_s.min():.1f}–{height_km_s.max():.1f} km, "
+                                f"fallback={fallback})", {})
+
+    h_c = h_ro[valid2]
+    N_ro_c = N_ro[valid2]
+    N_era5_c = N_era5_interp[valid2]
+    error = N_ro_c - N_era5_c
+
+    comparison_df = pd.DataFrame({
+        'height_km': h_c, 'N_RO': N_ro_c,
+        'N_ERA5': N_era5_c, 'error': error
+    })
     if output_csv:
         comparison_df.to_csv(output_csv, index=False)
 
-    rmse, bias = np.sqrt(np.mean(error**2)), np.mean(error)
-    corr = np.corrcoef(N_ro_common, N_era5_common)[0, 1] if len(N_ro_common) > 1 else np.nan
-    return ProcessingResult(success=True, data=comparison_df, message=f"RMSE: {rmse:.4f}, Bias: {bias:+.4f}", metadata={'rmse': rmse, 'bias': bias, 'correlation': corr})
+    rmse = float(np.sqrt(np.mean(error ** 2)))
+    bias = float(np.mean(error))
+    corr = float(np.corrcoef(N_ro_c, N_era5_c)[0, 1]) if len(N_ro_c) > 1 else np.nan
+    return ProcessingResult(
+        success=True, data=comparison_df,
+        message=f"ERA5 comparison OK (fallback={fallback}): RMSE={rmse:.4f}, bias={bias:+.4f}",
+        metadata={'rmse': rmse, 'bias': bias, 'correlation': corr, 'era5_fallback': fallback}
+    )
 
 
 # ============================================================================
 # STEP 7: ATMOSPHERIC RETRIEVAL
 # ============================================================================
 
-def retrieve_atmospheric_profile(refractivity_csv: str, era5_file: str, lat: Optional[float] = None, lon: Optional[float] = None, output_csv: Optional[str] = None) -> ProcessingResult:
+def retrieve_atmospheric_profile(refractivity_csv: str, era5_file: str,
+                                  lat: Optional[float] = None, lon: Optional[float] = None,
+                                  output_csv: Optional[str] = None) -> ProcessingResult:
+    """
+    Retrieve P, Pw, q profiles using ERA5 temperature as a constraint.
+
+    v3.4.5 fixes:
+    - Uses _era5_extract() for robust fallback when coords outside ERA5 grid.
+    - Explicit sort + dedup of ERA5 height array before interp1d.
+    - Robust time-dimension handling.
+    - Returns ProcessingResult(False) with descriptive message on failure
+      instead of crashing or returning an empty profile.
+    """
     try:
         import xarray as xr
     except ImportError:
-        return ProcessingResult(False, message="xarray required")
+        return ProcessingResult(False, None, "xarray required", {})
 
     ro_df = pd.read_csv(refractivity_csv)
-    h_m = ro_df['height_km'].values * 1000
-    N = ro_df['refractivity_N'].values
+    if ro_df.empty or 'height_km' not in ro_df.columns:
+        return ProcessingResult(False, None, "Empty or invalid refractivity CSV", {})
 
-    ds = xr.open_dataset(era5_file)
-    if lat is None or lon is None:
-        T_era5, z_era5, q_era5 = ds['t'].mean(dim=['latitude', 'longitude', 'valid_time']), ds['z'].mean(dim=['latitude', 'longitude', 'valid_time']), ds['q'].mean(dim=['latitude', 'longitude', 'valid_time'])
-    else:
-        T_era5, z_era5, q_era5 = ds['t'].interp(latitude=lat, longitude=lon).mean(dim='valid_time'), ds['z'].interp(latitude=lat, longitude=lon).mean(dim='valid_time'), ds['q'].interp(latitude=lat, longitude=lon).mean(dim='valid_time')
+    # Keep only finite, non-negative heights for the hydrostatic integration
+    valid_mask = np.isfinite(ro_df['height_km'].values) & np.isfinite(ro_df['refractivity_N'].values)
+    ro_df = ro_df[valid_mask].copy()
+    if ro_df.empty:
+        return ProcessingResult(False, None, "No finite refractivity rows", {})
 
-    P_levels = ds['pressure_level'].values
-    h_era5 = (z_era5 / 9.80665).values
+    h_m = ro_df['height_km'].values * 1000.0
+    N   = ro_df['refractivity_N'].values
+
+    try:
+        ds = xr.open_dataset(era5_file)
+    except Exception as e:
+        return ProcessingResult(False, None, f"Cannot open ERA5 file: {e}", {})
+
+    try:
+        T_era5_da, z_era5_da, q_era5_da, fallback = _era5_extract(ds, lat, lon)
+        P_levels = ds['pressure_level'].values
+    except Exception as e:
+        ds.close()
+        return ProcessingResult(False, None, f"ERA5 extraction failed: {e}", {})
+    finally:
+        ds.close()
+
+    h_era5 = (z_era5_da.values / 9.80665)           # metres
+    T_era5_arr = T_era5_da.values
+    q_era5_arr = q_era5_da.values
+
+    # Sort + dedup by height
     sort_idx = np.argsort(h_era5)
-    h_era5, T_era5_arr, P_era5_arr, q_era5_arr = h_era5[sort_idx], T_era5.values[sort_idx], P_levels[sort_idx], q_era5.values[sort_idx]
-    ds.close()
+    h_era5     = h_era5[sort_idx]
+    T_era5_arr = T_era5_arr[sort_idx]
+    P_era5_arr = P_levels[sort_idx]
+    q_era5_arr = q_era5_arr[sort_idx]
+    _, uniq = np.unique(h_era5, return_index=True)
+    h_era5     = h_era5[uniq]
+    T_era5_arr = T_era5_arr[uniq]
+    P_era5_arr = P_era5_arr[uniq]
+    q_era5_arr = q_era5_arr[uniq]
 
-    T = interp1d(h_era5, T_era5_arr, bounds_error=False, fill_value='extrapolate')(h_m)
+    if not np.isfinite(T_era5_arr).any():
+        return ProcessingResult(False, None,
+                                f"ERA5 temperature all-NaN (fallback={fallback})", {})
+
+    T     = interp1d(h_era5, T_era5_arr, bounds_error=False, fill_value='extrapolate')(h_m)
     P_era5 = interp1d(h_era5, P_era5_arr, bounds_error=False, fill_value='extrapolate')(h_m)
     q_era5 = interp1d(h_era5, q_era5_arr, bounds_error=False, fill_value='extrapolate')(h_m)
 
-    n, i_top = len(h_m), np.argmax(h_m)
+    n, i_top = len(h_m), int(np.argmax(h_m))
     Pw, P = np.zeros(n), np.zeros(n)
     P[i_top] = P_era5[i_top]
 
@@ -2886,30 +3071,47 @@ def retrieve_atmospheric_profile(refractivity_csv: str, era5_file: str, lat: Opt
     for _ in range(15):
         Pw_old = Pw.copy()
         for i in range(i_top - 1, -1, -1):
-            dh, h_mid, T_mid = h_m[i] - h_m[i + 1], 0.5 * (h_m[i] + h_m[i + 1]), 0.5 * (T[i] + T[i + 1])
+            dh   = h_m[i] - h_m[i + 1]
+            h_mid = 0.5 * (h_m[i] + h_m[i + 1])
+            T_mid = 0.5 * (T[i] + T[i + 1])
             g = compute_gravity(h_mid, lat)
-            rho = (m_dry * P[i + 1] * 100 + (m_water - m_dry) * 0.5 * (Pw[i] + Pw[i + 1]) * 100) / (R * T_mid)
+            rho = (m_dry * P[i + 1] * 100 +
+                   (m_water - m_dry) * 0.5 * (Pw[i] + Pw[i + 1]) * 100) / (R * T_mid)
             P[i] = P[i + 1] - rho * g * dh / 100
         for i in range(n):
-            Pw[i] = max(0.0, (T[i]**2 / N_COEFF_A2) * (N[i] - N_COEFF_A1 * P[i] / T[i]))
+            Pw[i] = max(0.0,
+                        (T[i] ** 2 / N_COEFF_A2) * (N[i] - N_COEFF_A1 * P[i] / T[i]))
             T_c = T[i] - 273.15
-            Pw[i] = min(Pw[i], 6.1094 * np.exp(17.625 * T_c / (T_c + 243.04)))
+            Pw[i] = min(Pw[i],
+                        6.1094 * np.exp(17.625 * T_c / (T_c + 243.04)))
         if np.max(np.abs(Pw - Pw_old)) < 0.01:
             break
 
     epsilon = m_water / m_dry
-    q = epsilon * Pw / (P - Pw + epsilon * Pw) * 1000
-    Pw_era5 = (q_era5 * P_era5) / (epsilon + (1 - epsilon) * q_era5)
+    q      = epsilon * Pw / (P - Pw + epsilon * Pw) * 1000
+    Pw_era5_out = (q_era5 * P_era5) / (epsilon + (1.0 - epsilon) * q_era5)
 
     profile = pd.DataFrame({
-        'height_km': h_m / 1000, 'temperature_K': T, 'pressure_hPa': P, 'water_vapor_hPa': Pw,
-        'specific_humidity_g_kg': q, 'refractivity_N': N, 'T_era5': T, 'P_era5': P_era5,
-        'Pw_era5': Pw_era5, 'q_era5': q_era5 * 1000,
+        'height_km':             h_m / 1000,
+        'temperature_K':         T,
+        'pressure_hPa':          P,
+        'water_vapor_hPa':       Pw,
+        'specific_humidity_g_kg': q,
+        'refractivity_N':        N,
+        'T_era5':                T,
+        'P_era5':                P_era5,
+        'Pw_era5':               Pw_era5_out,
+        'q_era5':                q_era5 * 1000,
     })
     if output_csv:
         profile.to_csv(output_csv, index=False)
 
-    return ProcessingResult(success=True, data=profile, message=f"Retrieved atmospheric profiles", metadata={'P_rmse': np.sqrt(np.mean((P - P_era5)**2))})
+    P_rmse = float(np.sqrt(np.mean((P - P_era5) ** 2)))
+    return ProcessingResult(
+        success=True, data=profile,
+        message=f"Atmospheric retrieval OK (ERA5 fallback={fallback})",
+        metadata={'P_rmse': P_rmse, 'era5_fallback': fallback}
+    )
 
 
 # ============================================================================

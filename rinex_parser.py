@@ -13,7 +13,7 @@ from pathlib import Path
 # GNSS System mappings
 GNSS_SYSTEMS = {
     'G': 'GPS',
-    'R': 'GLONASS',
+    'R': 'GLO',    # Match UBX GNSS_ID_MAP and SP3 CONSTELLATION_MAP
     'E': 'GAL',
     'C': 'BDS',
     'J': 'QZSS',

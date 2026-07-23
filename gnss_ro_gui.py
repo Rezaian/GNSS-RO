@@ -16,16 +16,6 @@ Features:
 import sys
 import os
 import json
-
-# ---------------------------------------------------------------------------
-# PyInstaller bundle compatibility
-# When frozen, bundled .py modules live in sys._MEIPASS, which is NOT on
-# sys.path by default.  Insert it at position 0 so that `import qt_compat`,
-# `import ground_gnss_ro_pipeline`, etc. all resolve correctly on Windows.
-# This is a no-op in normal (non-frozen) Python execution.
-# ---------------------------------------------------------------------------
-if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-    sys.path.insert(0, sys._MEIPASS)
 import glob
 from datetime import datetime
 from typing import Dict, Optional, Any, List
@@ -1065,45 +1055,42 @@ class StationInfoPanel(QGroupBox):
 
 class ProcessingPanel(QGroupBox):
     """
-    Collapsible 'Advanced Settings' panel exposing the tunable PROCESSING
+    Collapsible Advanced Settings panel exposing the tunable PROCESSING
     constants from the .cra file.
 
-    Loading order on directory pick:
-        1. PROCESSING_DEFAULTS (always)
-        2. Overlay with .cra's PROCESSING block if present
-        3. User may edit before pressing Run
-
-    On Run, the displayed values are written back into the .cra under
-    "PROCESSING" (merge-save, never overwriting other keys).
+    v3.4.5 layout: wrapped in a QScrollArea so the form never overflows on
+    low-resolution screens (HD 720p on Windows).  Height is capped at 55% of
+    the available screen height; spin-box minimum widths prevent compression.
     """
 
-    # Field spec: (key, label, kind, min, max, decimals/step, tooltip)
+    # Field spec: (key, label, kind, min, max, decimals, tooltip)
     _SPEC = [
-        ('POLY_SMOOTH_WINDOW',       'Poly smooth window (s)',    'float', 0.0, 10000.0, 1,    "Polynomial smoothing window length (seconds). 50Hz → ~150."),
-        ('POLYFIT_GAP_THRESHOLD',    'Polyfit gap threshold (s)', 'float', 0.1, 600.0,   1,    "Restart polyfit when time gap ≥ this many seconds."),
-        ('RO_ELEVATION_THRESHOLD',   'RO elevation thresh (°)',   'float', -10.0, 90.0,  2,    "Elevation below which RO geometry is sought."),
-        ('RO_DOPPLER_THRESHOLD',     'RO Doppler thresh (Hz)',    'float', 0.0, 100.0,   2,    "Minimum |atmos_doppler| to flag an RO event."),
-        ('RO_MIN_EPOCHS',            'RO min epochs',             'int',   1,   100000,  1,    "Minimum RO epochs for a valid event."),
-        ('REF_SAT_ELEVATION_THRESHOLD','Ref-sat elev thresh (°)', 'float', 0.0, 90.0,    1,    "Minimum elevation for reference satellite candidates."),
-        ('REF_SAT_MIN_EPOCHS',       'Ref-sat min epochs',        'int',   1,   100000,  1,    "Minimum coverage for a reference satellite."),
-        ('REF_SAT_JUMP_THRESHOLD',   'Ref-sat jump thresh (Hz)',  'float', 0.0, 100.0,   2,    "Epoch-to-epoch excess Doppler jump (cycle-slip detection)."),
-        ('N_COEFF_A1',               'Smith–Weintraub a1',        'float', 0.0, 1e6,     3,    "Refractivity dry term coefficient."),
-        ('N_COEFF_A2',               'Smith–Weintraub a2',        'float', 0.0, 1e9,     2,    "Refractivity wet term coefficient."),
-        ('KEEP_INTERMEDIATE_CSVS',   'Keep step1–3 CSVs',         'bool',  None, None,   None, "If checked, intermediate step1/2/3 CSVs are not deleted after a successful run (useful for debugging)."),
-        ('FORCE_CRA_STATION_COORDS', 'Force .cra station coords', 'bool',  None, None,   None, "If checked, station coordinates from .cra override the RINEX header. Default off (RINEX wins)."),
+        ('POLY_SMOOTH_WINDOW_S',           'Poly smooth window (s)',    'float', 0.0,   10000.0, 1,    "Polynomial smoothing window (s). 50 Hz data → ~150."),
+        ('POLYFIT_GAP_THRESHOLD_S',        'Polyfit gap threshold (s)', 'float', 0.1,   600.0,   1,    "Restart polyfit when time gap ≥ this many seconds."),
+        ('RO_ELEVATION_THRESHOLD_DEG',     'RO elevation thresh (°)',   'float', -10.0, 90.0,    2,    "Elevation below which RO geometry is sought."),
+        ('RO_DOPPLER_THRESHOLD_HZ',        'RO Doppler thresh (Hz)',    'float', 0.0,   100.0,   2,    "Minimum |atmos_doppler| to flag an RO event."),
+        ('RO_MIN_EPOCHS',                  'RO min epochs',             'int',   1,     100000,  1,    "Minimum RO epochs for a valid event."),
+        ('REF_SAT_ELEVATION_THRESHOLD_DEG','Ref-sat elev thresh (°)',   'float', 0.0,   90.0,    1,    "Minimum elevation for reference satellite candidates."),
+        ('REF_SAT_MIN_EPOCHS',             'Ref-sat min epochs',        'int',   1,     100000,  1,    "Minimum coverage for a reference satellite."),
+        ('REF_SAT_JUMP_THRESHOLD_HZ',      'Ref-sat jump thresh (Hz)', 'float', 0.0,   100.0,   2,    "Epoch-to-epoch excess Doppler jump (cycle-slip detection)."),
+        ('N_COEFF_A1',                     'Smith–Weintraub a1',        'float', 0.0,   1e6,     3,    "Refractivity dry term coefficient (unitless)."),
+        ('N_COEFF_A2',                     'Smith–Weintraub a2',        'float', 0.0,   1e9,     2,    "Refractivity wet term coefficient (unitless)."),
+        ('KEEP_INTERMEDIATE_CSVS',         'Keep step1–3 CSVs',         'bool',  None,  None,    None, "Keep intermediate step1/2/3 CSVs after a successful run."),
+        ('FORCE_CRA_STATION_COORDS',       'Force .cra station coords', 'bool',  None,  None,    None, "Station coords from .cra override the RINEX header."),
     ]
 
     def __init__(self, parent=None):
         super().__init__("Advanced Settings", parent)
         self.setCheckable(True)
-        self.setChecked(False)  # collapsed by default
+        self.setChecked(False)           # collapsed by default
         self._widgets: Dict[str, QWidget] = {}
 
-        body = QWidget(self)
-        form = QFormLayout(body)
+        # Build form inside a plain widget -----------------------------------
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setContentsMargins(8, 4, 8, 4)
-        form.setSpacing(4)
+        form.setContentsMargins(4, 2, 4, 6)
+        form.setSpacing(3)
 
         for key, label, kind, mn, mx, step, tip in self._SPEC:
             w: QWidget
@@ -1112,9 +1099,11 @@ class ProcessingPanel(QGroupBox):
                 w.setDecimals(int(step) if isinstance(step, int) else 3)
                 w.setRange(float(mn), float(mx))
                 w.setSingleStep(0.1)
+                w.setMinimumWidth(90)
             elif kind == 'int':
                 w = QSpinBox()
                 w.setRange(int(mn), int(mx))
+                w.setMinimumWidth(90)
             elif kind == 'bool':
                 w = QCheckBox()
             else:
@@ -1123,23 +1112,38 @@ class ProcessingPanel(QGroupBox):
             self._widgets[key] = w
             form.addRow(label, w)
 
+        # Scroll area — caps height to 55% of screen so the panel never
+        # pushes below the visible area on 720p / HD displays.
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(form_widget)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        try:
+            screen_h = QApplication.primaryScreen().availableGeometry().height()
+        except Exception:
+            screen_h = 768
+        self._scroll.setMaximumHeight(max(200, int(screen_h * 0.55)))
+
+        # GroupBox layout ----------------------------------------------------
         wrap = QVBoxLayout(self)
-        wrap.setContentsMargins(6, 6, 6, 6)
-        wrap.addWidget(body)
-        self._body = body
+        wrap.setContentsMargins(4, 4, 4, 4)
+        wrap.setSpacing(0)
+        wrap.addWidget(self._scroll)
 
-        # Toggle visibility with the groupbox checkbox.
+        # Wire toggle and set initial state ----------------------------------
         self.toggled.connect(self._on_toggled)
-        self._on_toggled(self.isChecked())
+        self._on_toggled(False)          # start collapsed
 
-        # Initialise with defaults.
         self.load_from_cra({})
 
     def _on_toggled(self, checked: bool):
-        # Hide/show the body. Avoids fighting Qt's native "checkable" behaviour
-        # (which only greys out, doesn't collapse).
-        self._body.setVisible(checked)
-        self.adjustSize()
+        """Show/hide the scroll area; reflow the sidebar so no gap is left."""
+        self._scroll.setVisible(checked)
+        self.updateGeometry()
+        p = self.parent()
+        if p is not None:
+            p.updateGeometry()
 
     def load_from_cra(self, cra_data: Optional[Dict]):
         """Populate the widgets from a parsed .cra dict (or defaults)."""

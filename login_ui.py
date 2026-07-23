@@ -324,14 +324,31 @@ class LoginDialog(QDialog):
         else:
             super().keyPressEvent(event)
     
+    @staticmethod
+    def _global_pos(event):
+        """Return global position as QPoint for PyQt5 and PyQt6.
+        PyQt6: event.globalPosition().toPoint()
+        PyQt5: event.globalPos()
+        """
+        try:
+            return event.globalPosition().toPoint()
+        except AttributeError:
+            return event.globalPos()
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-    
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_pos = self._global_pos(event) - self.frameGeometry().topLeft()
+        except Exception:
+            self._drag_pos = None
+
     def mouseMoveEvent(self, event):
-        if self._drag_pos and event.buttons() == Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-    
+        try:
+            if self._drag_pos is not None and event.buttons() == Qt.MouseButton.LeftButton:
+                self.move(self._global_pos(event) - self._drag_pos)
+        except Exception:
+            pass
+
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
     
