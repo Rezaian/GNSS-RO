@@ -1,9 +1,7 @@
 __pycache__/
-*.pyc
-
-# macOS
+*.py[cod]
+build/
+dist/
+*.spec
 .DS_Store
-**/.DS_Store
-
-# Sample/output data
-sample_data/
+*_output/

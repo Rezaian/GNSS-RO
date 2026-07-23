@@ -20,11 +20,32 @@ import glob
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
+# ============================================================================
+# FROZEN-BUILD IMPORT PATH
+# ============================================================================
+# In a PyInstaller bundle the sibling modules (qt_compat, login_ui,
+# plot_style, the two pipelines, rinex_parser) are imported through
+# PyInstaller's FrozenImporter and normally resolve without help.  Putting
+# _MEIPASS on sys.path explicitly is a cheap safety net for two cases where
+# that has been observed to be incomplete on Windows:
+#
+#   - --onefile builds where a module is reached only from a lazy, function
+#     level import (plot_style is imported inside the plotting functions);
+#   - the 'spawn' multiprocessing children, which re-launch the executable
+#     and rebuild their own sys.path from scratch.
+#
+# It is a no-op when running from source.
+# ============================================================================
+
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    if sys._MEIPASS not in sys.path:
+        sys.path.insert(0, sys._MEIPASS)
+
 from qt_compat import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog,
     QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
-    QSplitter, QMessageBox, Qt, QTimer, QColor, QFont,
+    QSplitter, QMessageBox, Qt, QTimer, QColor, QFont, QSize,
     QCheckBox, QFormLayout, QDoubleSpinBox, QSpinBox, QScrollArea,
     QToolButton, QSizePolicy, QFrame,
     exec_app
@@ -57,6 +78,52 @@ from matplotlib.figure import Figure
 import multiprocessing as mp
 from multiprocessing import Process, Queue
 from login_ui import LoginDialog
+
+
+# ============================================================================
+# v3.4.7 — UI SIZE TUNING (single place to adjust every GUI font)
+# ============================================================================
+# All values are CSS pixels as used by Qt style sheets.  The application base
+# font is 12 pt, which Windows renders as ~16 px at 96 DPI — that is the
+# "current" figure the deltas below are measured against.
+#
+# Adjusted in v3.4.7 after review of the compiled Windows build on a 1366x768
+# (non-Full-HD) laptop:
+#
+#   sidebar        16 -> 19  (+3)   requested +2..4
+#   browse panel   16 -> 13  (-3)   requested -2..4   (path field + Browse)
+#   browse notes   12 -> 15  (+3)   requested +2..4   (validation / warnings)
+#   result legend  11 -> 14  (+3)   requested +2..4   (RO / profile sub-notes)
+#   sidebar button 14 -> 17  (+3)   part of the sidebar
+#   status panel   unchanged        "processing panel fonts is ok"
+#   toolbar icons  24 -> 18         "plot panel icon size decreased"
+# ============================================================================
+
+FS_SIDEBAR        = 19   # group titles, labels and fields in the left sidebar
+FS_SIDEBAR_BTN    = 17   # Start Processing / Stop buttons
+FS_BROWSE         = 13   # data-directory path field and Browse button
+FS_BROWSE_NOTE    = 15   # validation / warning notes under the Browse row
+FS_RESULT_LIST    = 13   # rows in the Results list (unchanged)
+FS_RESULT_NOTE    = 14   # legend / sub-notes under the Results list
+FS_STATUS         = 16   # Processing Status panel  (unchanged by request)
+FS_STATUS_DETAIL  = 12   # Processing Status detail line (unchanged by request)
+FS_ADVANCED       = 16   # Advanced Settings form (unchanged; dense layout)
+FS_TABS           = 13   # plot tab bar (unchanged)
+FS_PLOT_PLACEHOLD = 15   # "Select an item ..." text drawn on an empty canvas
+
+TOOLBAR_ICON_PX   = 18   # matplotlib navigation toolbar icons (default 24)
+
+# Sidebar geometry — widened to absorb the larger sidebar font without
+# clipping the "Altitude:" / "Ref-sat elev thresh" labels.
+SIDEBAR_MIN_W     = 340
+SIDEBAR_MAX_W     = 420
+
+# ----------------------------------------------------------------------------
+# v3.4.7 — display name for ground-based data in the browse panel.
+# The processing code, file names and output folders are untouched; this only
+# changes what the operator reads in the Data Directory tag line.
+# ----------------------------------------------------------------------------
+GROUND_DISPLAY_NAME = "Mountain"
 
 
 # ============================================================================
@@ -888,6 +955,48 @@ def run_satellite_pipeline(conphs_dir: str, output_dir: str, progress_queue: Que
 
 
 # ============================================================================
+# v3.4.7 — WORD-WRAPPING LABEL
+# ============================================================================
+
+class WrapLabel(QLabel):
+    """QLabel that reports an honest height for its wrapped text.
+
+    A plain word-wrapped QLabel returns a single-line ``minimumSizeHint``, so a
+    QVBoxLayout gives it too little vertical space and silently clips the last
+    line.  That was invisible at the old 11-12 px note sizes but became obvious
+    in v3.4.7 once the browse-panel warnings and the results legend were
+    enlarged.  Overriding ``minimumSizeHint`` to use ``heightForWidth`` makes
+    the layout reserve the full wrapped height.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Minimum)
+
+    def setText(self, text):
+        super().setText(text)
+        self.updateGeometry()
+
+    def minimumSizeHint(self):
+        w = self.width()
+        if w <= 0:
+            return super().minimumSizeHint()
+        return QSize(0, self.heightForWidth(w))
+
+    def sizeHint(self):
+        w = self.width()
+        if w <= 0:
+            return super().sizeHint()
+        return QSize(w, self.heightForWidth(w))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.updateGeometry()
+
+
+# ============================================================================
 # PLOT CANVAS
 # ============================================================================
 
@@ -903,7 +1012,7 @@ class PlotCanvas(FigureCanvas):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
         ax.text(0.5, 0.5, message, ha='center', va='center',
-                fontsize=13, color='#757575', transform=ax.transAxes)
+                fontsize=FS_PLOT_PLACEHOLD, color='#757575', transform=ax.transAxes)
         ax.axis('off')
         self._is_placeholder = True
         self.draw()
@@ -920,7 +1029,7 @@ class PlotCanvas(FigureCanvas):
         else:
             ax = self.fig.add_subplot(111)
             ax.text(0.5, 0.5, "Plot not available", ha='center', va='center',
-                    fontsize=13, color='#757575', transform=ax.transAxes)
+                    fontsize=FS_PLOT_PLACEHOLD, color='#757575', transform=ax.transAxes)
             ax.axis('off')
             self._is_placeholder = True
         self.draw()
@@ -938,13 +1047,26 @@ class InteractivePlotWidget(QWidget):
 
         self.canvas = PlotCanvas(self)
         self.toolbar = NavigationToolbar(self.canvas, self)
-        self.toolbar.setStyleSheet("""
-            QToolBar {
-                spacing: 6px;
-                padding: 2px 4px;
+
+        # v3.4.7 — shrink the toolbar icons (matplotlib defaults to 24 px,
+        # which dominated the plot panel on the 1366x768 Windows build).
+        try:
+            self.toolbar.setIconSize(QSize(TOOLBAR_ICON_PX, TOOLBAR_ICON_PX))
+        except Exception:
+            pass
+
+        self.toolbar.setStyleSheet(f"""
+            QToolBar {{
+                spacing: 4px;
+                padding: 1px 4px;
                 background: #F5F5F5;
                 border-bottom: 1px solid #CCCCCC;
-            }
+            }}
+            QToolButton {{
+                padding: 1px;
+                font-size: {FS_BROWSE}px;
+            }}
+            QToolBar QLabel {{ font-size: {FS_BROWSE}px; }}
         """)
 
         layout.addWidget(self.toolbar)
@@ -1081,6 +1203,16 @@ class ProcessingPanel(QGroupBox):
 
     def __init__(self, parent=None):
         super().__init__("Advanced Settings", parent)
+        # v3.4.7 — pinned: this is a dense 12-row form inside a 340-420 px
+        # sidebar, so it keeps the v3.4.6 size rather than following FS_SIDEBAR.
+        self.setStyleSheet(f"""
+            QGroupBox {{ font-size: {FS_ADVANCED}px; }}
+            QGroupBox QLabel {{ font-size: {FS_ADVANCED}px; }}
+            QGroupBox QCheckBox {{ font-size: {FS_ADVANCED}px; }}
+            QGroupBox QSpinBox, QGroupBox QDoubleSpinBox {{
+                font-size: {FS_ADVANCED}px;
+            }}
+        """)
         self.setCheckable(True)
         self.setChecked(False)           # collapsed by default
         self._widgets: Dict[str, QWidget] = {}
@@ -1193,18 +1325,18 @@ class ResultListWidget(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlternatingRowColors(True)
-        self.setStyleSheet("""
-            QListWidget {
+        self.setStyleSheet(f"""
+            QListWidget {{
                 font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 13px;
+                font-size: {FS_RESULT_LIST}px;
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
-            }
-            QListWidget::item { padding: 4px 8px; }
-            QListWidget::item:selected {
+            }}
+            QListWidget::item {{ padding: 4px 8px; }}
+            QListWidget::item:selected {{
                 background-color: #1976D2;
                 color: white;
-            }
+            }}
         """)
         self.current_mode = None  # 'ground' or 'satellite'
     
@@ -1405,8 +1537,16 @@ class ProgressPanel(QGroupBox):
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
         
+        # v3.4.7 — "processing panel fonts is ok": pinned to the v3.4.6
+        # effective sizes so the enlarged sidebar rule does not touch them.
+        self.setStyleSheet(f"""
+            QGroupBox {{ font-size: {FS_STATUS}px; }}
+            QGroupBox QLabel {{ font-size: {FS_STATUS}px; }}
+        """)
+
         self.status_label = QLabel("Idle")
-        self.status_label.setStyleSheet("font-weight: bold; color: #424242;")
+        self.status_label.setStyleSheet(
+            f"font-weight: bold; color: #424242; font-size: {FS_STATUS}px;")
         layout.addWidget(self.status_label)
         
         self.progress_bar = QProgressBar()
@@ -1428,29 +1568,34 @@ class ProgressPanel(QGroupBox):
         layout.addWidget(self.progress_bar)
         
         self.detail_label = QLabel("")
-        self.detail_label.setStyleSheet("color: #616161; font-size: 12px;")
+        self.detail_label.setStyleSheet(
+            f"color: #616161; font-size: {FS_STATUS_DETAIL}px;")
         self.detail_label.setWordWrap(True)
         layout.addWidget(self.detail_label)
     
     def set_status(self, status: str, detail: str = "", progress: float = 0):
         self.status_label.setText(status)
-        self.status_label.setStyleSheet("font-weight: bold; color: #1976D2;")
+        self.status_label.setStyleSheet(
+            f"font-weight: bold; color: #1976D2; font-size: {FS_STATUS}px;")
         self.detail_label.setText(detail)
         self.progress_bar.setValue(int(progress * 100))
     
     def set_complete(self, success: bool, message: str):
         if success:
             self.status_label.setText("Completed")
-            self.status_label.setStyleSheet("font-weight: bold; color: #2E7D32;")
+            self.status_label.setStyleSheet(
+            f"font-weight: bold; color: #2E7D32; font-size: {FS_STATUS}px;")
             self.progress_bar.setValue(100)
         else:
             self.status_label.setText("Stopped" if "cancel" in message.lower() else "Failed")
-            self.status_label.setStyleSheet("font-weight: bold; color: #D32F2F;")
+            self.status_label.setStyleSheet(
+            f"font-weight: bold; color: #D32F2F; font-size: {FS_STATUS}px;")
         self.detail_label.setText(message)
     
     def reset(self):
         self.status_label.setText("Idle")
-        self.status_label.setStyleSheet("font-weight: bold; color: #424242;")
+        self.status_label.setStyleSheet(
+            f"font-weight: bold; color: #424242; font-size: {FS_STATUS}px;")
         self.detail_label.setText("")
         self.progress_bar.setValue(0)
 
@@ -1463,8 +1608,23 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GNSS Radio Occultation Processor v3")
-        self.setMinimumSize(1200, 800)
+        self.setWindowTitle("GNSS Radio Occultation Processor v3.4.7")
+
+        # v3.4.7 — a 1200x800 minimum does not fit a 1366x768 laptop: the
+        # window was forced taller than the desktop and the bottom of the
+        # sidebar (Results list) fell below the taskbar.  Clamp the minimum
+        # to the available geometry and open maximised on short screens.
+        try:
+            avail = QApplication.primaryScreen().availableGeometry()
+            min_w = min(1200, max(1000, avail.width() - 40))
+            min_h = min(800, max(620, avail.height() - 40))
+            self.setMinimumSize(min_w, min_h)
+            self.resize(min(1400, avail.width()), min(900, avail.height()))
+            # Applied after _setup_ui() so we never flash an empty window.
+            self._start_maximized = avail.height() < 800
+        except Exception:
+            self.setMinimumSize(1100, 640)
+            self._start_maximized = False
         
         self.input_dir = None
         self.scan_result = None
@@ -1497,7 +1657,10 @@ class MainWindow(QMainWindow):
         
         self._setup_ui()
         self._connect_signals()
-    
+
+        if getattr(self, '_start_maximized', False):
+            self.showMaximized()
+
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -1510,32 +1673,57 @@ class MainWindow(QMainWindow):
         
         # SIDEBAR
         sidebar = QWidget()
-        sidebar.setMaximumWidth(350)
-        sidebar.setMinimumWidth(300)
+        sidebar.setObjectName("sidebar")
+        sidebar.setMaximumWidth(SIDEBAR_MAX_W)
+        sidebar.setMinimumWidth(SIDEBAR_MIN_W)
+
+        # v3.4.7 — one scoped rule enlarges every sidebar control.  Panels that
+        # must NOT grow (Processing Status, Advanced Settings, the Results list
+        # and the Browse row) set their own style sheet, which Qt resolves with
+        # higher priority than this ancestor rule.
+        sidebar.setStyleSheet(f"""
+            #sidebar QGroupBox {{
+                font-size: {FS_SIDEBAR}px;
+                font-weight: 600;
+            }}
+            #sidebar QLabel     {{ font-size: {FS_SIDEBAR}px; }}
+            #sidebar QLineEdit  {{ font-size: {FS_SIDEBAR}px; }}
+            #sidebar QCheckBox  {{ font-size: {FS_SIDEBAR}px; }}
+            #sidebar QPushButton {{ font-size: {FS_SIDEBAR}px; }}
+        """)
+
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(8)
-        
+
+        # ------------------------------------------------------------------
         # Input directory
+        # v3.4.7 — the path field and the Browse button are the one place that
+        # gets SMALLER: the path string is long and was truncating on the HD
+        # laptop.  The validation / warning notes underneath get LARGER.
+        # ------------------------------------------------------------------
         input_group = QGroupBox("Data Directory")
         input_layout = QVBoxLayout(input_group)
-        
+
         dir_layout = QHBoxLayout()
         self.dir_edit = QLineEdit()
         self.dir_edit.setPlaceholderText("Ground: .ubx/.sp3 | Satellite: conPhs_*")
         self.dir_edit.setReadOnly(True)
+        self.dir_edit.setStyleSheet(f"QLineEdit {{ font-size: {FS_BROWSE}px; }}")
         dir_layout.addWidget(self.dir_edit)
-        
+
         self.browse_btn = QPushButton("Browse")
-        self.browse_btn.setMaximumWidth(70)
+        self.browse_btn.setMaximumWidth(80)
+        self.browse_btn.setStyleSheet(
+            f"QPushButton {{ font-size: {FS_BROWSE}px; padding: 4px 8px; }}")
         dir_layout.addWidget(self.browse_btn)
         input_layout.addLayout(dir_layout)
-        
-        self.validation_label = QLabel("")
-        self.validation_label.setWordWrap(True)
-        self.validation_label.setStyleSheet("font-size: 12px;")
+
+        self.validation_label = WrapLabel("")
+        self.validation_label.setStyleSheet(
+            f"QLabel {{ font-size: {FS_BROWSE_NOTE}px; }}")
         input_layout.addWidget(self.validation_label)
-        
+
         sidebar_layout.addWidget(input_group)
         
         # Station (only for ground)
@@ -1555,35 +1743,35 @@ class MainWindow(QMainWindow):
         self.run_btn = QPushButton("Start Processing")
         self.run_btn.setEnabled(False)
         self.run_btn.setMinimumHeight(38)
-        self.run_btn.setStyleSheet("""
-            QPushButton {
+        self.run_btn.setStyleSheet(f"""
+            QPushButton {{
                 background-color: #1976D2;
                 color: white;
                 font-weight: bold;
-                font-size: 14px;
+                font-size: {FS_SIDEBAR_BTN}px;
                 border: none;
                 border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #1565C0; }
-            QPushButton:pressed { background-color: #0D47A1; }
-            QPushButton:disabled { background-color: #BDBDBD; }
+            }}
+            QPushButton:hover {{ background-color: #1565C0; }}
+            QPushButton:pressed {{ background-color: #0D47A1; }}
+            QPushButton:disabled {{ background-color: #BDBDBD; }}
         """)
         
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.setMinimumHeight(38)
-        self.stop_btn.setStyleSheet("""
-            QPushButton {
+        self.stop_btn.setStyleSheet(f"""
+            QPushButton {{
                 background-color: #D32F2F;
                 color: white;
                 font-weight: bold;
-                font-size: 14px;
+                font-size: {FS_SIDEBAR_BTN}px;
                 border: none;
                 border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #C62828; }
-            QPushButton:pressed { background-color: #B71C1C; }
-            QPushButton:disabled { background-color: #BDBDBD; }
+            }}
+            QPushButton:hover {{ background-color: #C62828; }}
+            QPushButton:pressed {{ background-color: #B71C1C; }}
+            QPushButton:disabled {{ background-color: #BDBDBD; }}
         """)
         
         btn_layout.addWidget(self.run_btn, 2)
@@ -1601,8 +1789,10 @@ class MainWindow(QMainWindow):
         self.result_list = ResultListWidget()
         result_layout.addWidget(self.result_list)
         
-        self.legend_label = QLabel("● Success/RO    ○ Failed/No RO")
-        self.legend_label.setStyleSheet("color: #757575; font-size: 11px;")
+        # v3.4.7 — "results box sub notes" (RO / profile / no profile ...)
+        self.legend_label = WrapLabel("● Success/RO    ○ Failed/No RO")
+        self.legend_label.setStyleSheet(
+            f"QLabel {{ color: #757575; font-size: {FS_RESULT_NOTE}px; }}")
         result_layout.addWidget(self.legend_label)
         
         sidebar_layout.addWidget(result_group, 1)
@@ -1615,16 +1805,16 @@ class MainWindow(QMainWindow):
         main_panel_layout.setContentsMargins(0, 0, 0, 0)
         
         self.tab_widget = QTabWidget()
-        self.tab_widget.setStyleSheet("""
-            QTabWidget::pane {
+        self.tab_widget.setStyleSheet(f"""
+            QTabWidget::pane {{
                 border: 1px solid #CCCCCC;
                 border-radius: 4px;
-            }
-            QTabBar::tab {
+            }}
+            QTabBar::tab {{
                 padding: 8px 16px;
-                font-size: 13px;
-            }
-            QTabBar::tab:selected { font-weight: bold; }
+                font-size: {FS_TABS}px;
+            }}
+            QTabBar::tab:selected {{ font-weight: bold; }}
         """)
         
         self.raw_canvas = InteractivePlotWidget()
@@ -1642,7 +1832,7 @@ class MainWindow(QMainWindow):
         main_panel_layout.addWidget(self.tab_widget)
         splitter.addWidget(main_panel)
         
-        splitter.setSizes([320, 880])
+        splitter.setSizes([SIDEBAR_MIN_W, 880])
     
     def _connect_signals(self):
         self.browse_btn.clicked.connect(self._browse_directory)
@@ -1689,11 +1879,13 @@ class MainWindow(QMainWindow):
 
         # Data type indicator
         if self.scan_result['data_type'] == DataType.GROUND:
-            msgs.append("<span style='color:#1976D2; font-weight:bold;'>📡 Ground-based data</span>")
+            msgs.append(f"<span style='color:#1976D2; font-weight:bold;'>"
+                        f"📡 {GROUND_DISPLAY_NAME}-based data</span>")
         elif self.scan_result['data_type'] == DataType.SATELLITE:
             msgs.append("<span style='color:#7B1FA2; font-weight:bold;'>🛰 Satellite (LEO) data</span>")
         elif self.scan_result['data_type'] == DataType.BOTH:
-            msgs.append("<span style='color:#00796B; font-weight:bold;'>📡🛰 Ground + Satellite data</span>")
+            msgs.append(f"<span style='color:#00796B; font-weight:bold;'>"
+                        f"📡🛰 {GROUND_DISPLAY_NAME} + Satellite data</span>")
 
         # Info messages
         for info in self.scan_result['info']:
@@ -1792,11 +1984,12 @@ class MainWindow(QMainWindow):
         # Compose status message.
         msgs = ["<span style='color:#00695C; font-weight:bold;'>📂 Loaded previous results</span>"]
         if out_info['data_type'] == DataType.GROUND:
-            msgs.append("<span style='color:#1976D2'>📡 Ground project</span>")
+            msgs.append(f"<span style='color:#1976D2'>📡 {GROUND_DISPLAY_NAME} project</span>")
         elif out_info['data_type'] == DataType.SATELLITE:
             msgs.append("<span style='color:#7B1FA2'>🛰 Satellite project</span>")
         elif out_info['data_type'] == DataType.BOTH:
-            msgs.append("<span style='color:#00796B'>📡🛰 Ground + Satellite project</span>")
+            msgs.append(f"<span style='color:#00796B'>"
+                        f"📡🛰 {GROUND_DISPLAY_NAME} + Satellite project</span>")
         for w in out_info.get('warnings', []):
             msgs.append(f"<span style='color:#F57C00'>⚠ {w}</span>")
         for e in out_info.get('errors', []):

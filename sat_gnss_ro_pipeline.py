@@ -2004,6 +2004,8 @@ class PipelinePlotter:
         """Generate both panel plots."""
         import matplotlib
         matplotlib.use('Agg')
+        from plot_style import apply_plot_fonts
+        apply_plot_fonts()   # v3.4.7 — larger tick / axis / legend text
         
         saved_files = []
         
@@ -2024,9 +2026,11 @@ class PipelinePlotter:
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
         from datetime import timedelta
+        from plot_style import apply_plot_fonts
+        apply_plot_fonts()
         
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle(f'Raw GNSS Observations: {event_id}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'Raw GNSS Observations: {event_id}', fontsize=18, fontweight='bold')
         
         t_rel = event.time_hr - event.time_hr[0]
         base_time = event.start_time
@@ -2039,8 +2043,8 @@ class PipelinePlotter:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
         ax.set_xlabel('UTC Time')
         ax.set_ylabel('Excess Phase (m)')
-        ax.set_title('(a) Excess Phase vs Time', fontsize=11, fontweight='bold')
-        ax.legend(fontsize=8, loc='best')
+        ax.set_title('(a) Excess Phase vs Time', fontsize=15, fontweight='bold')
+        ax.legend(fontsize=10, loc='best')
         ax.grid(True, alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right')
         
@@ -2051,8 +2055,8 @@ class PipelinePlotter:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
         ax.set_xlabel('UTC Time')
         ax.set_ylabel('SNR (V/V)')
-        ax.set_title('(b) Signal-to-Noise Ratio', fontsize=11, fontweight='bold')
-        ax.legend(fontsize=8, loc='best')
+        ax.set_title('(b) Signal-to-Noise Ratio', fontsize=15, fontweight='bold')
+        ax.legend(fontsize=10, loc='best')
         ax.grid(True, alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right')
         
@@ -2062,8 +2066,8 @@ class PipelinePlotter:
         ax.plot(event.excess_L2, event.occ_height, color=self.colors['L2'], lw=0.8, label='L2', alpha=0.8)
         ax.set_xlabel('Excess Phase (m)')
         ax.set_ylabel('Occultation Height (km)')
-        ax.set_title('(c) Excess Phase vs Height', fontsize=11, fontweight='bold')
-        ax.legend(fontsize=8, loc='best')
+        ax.set_title('(c) Excess Phase vs Height', fontsize=15, fontweight='bold')
+        ax.legend(fontsize=10, loc='best')
         ax.grid(True, alpha=0.3)
         
         # (d) Height vs Time
@@ -2072,7 +2076,7 @@ class PipelinePlotter:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
         ax.set_xlabel('UTC Time')
         ax.set_ylabel('Occultation Height (km)')
-        ax.set_title('(d) Occultation Height vs Time', fontsize=11, fontweight='bold')
+        ax.set_title('(d) Occultation Height vs Time', fontsize=15, fontweight='bold')
         ax.grid(True, alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right')
         
@@ -2095,9 +2099,11 @@ class PipelinePlotter:
     ) -> str:
         """Generate Panel 2: Derived Atmospheric Profiles (2x2)."""
         import matplotlib.pyplot as plt
-        
+        from plot_style import apply_plot_fonts
+        apply_plot_fonts()
+
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle(f'Derived Atmospheric Profiles: {event_id}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'Derived Atmospheric Profiles: {event_id}', fontsize=18, fontweight='bold')
         
         # (a) Bending Angle Profile
         ax = axes[0, 0]
@@ -2118,15 +2124,15 @@ class PipelinePlotter:
         
         ax.set_xlabel('Bending Angle (mrad)')
         ax.set_ylabel('Tangent Height (km)')
-        ax.set_title('(a) Bending Angle Profile', fontsize=11, fontweight='bold')
-        ax.legend(fontsize=8, loc='upper right')
+        ax.set_title('(a) Bending Angle Profile', fontsize=15, fontweight='bold')
+        ax.legend(fontsize=10, loc='upper right')
         ax.grid(True, alpha=0.3)
         ax.set_xlim(left=0)
         ax.set_ylim([0, 60])
         
         if val_bending and val_bending.n_points > 0:
             stats = f'RMSE: {val_bending.rmse*1e6:.1f} µrad\nr: {val_bending.correlation:.3f}'
-            ax.text(0.95, 0.05, stats, transform=ax.transAxes, fontsize=8,
+            ax.text(0.95, 0.05, stats, transform=ax.transAxes, fontsize=10,
                     ha='right', va='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         # (b) Refractivity Profile
@@ -2153,15 +2159,15 @@ class PipelinePlotter:
         
         ax.set_xlabel('Refractivity (N-units)')
         ax.set_ylabel('Height (km)')
-        ax.set_title('(b) Refractivity Profile', fontsize=11, fontweight='bold')
-        ax.legend(fontsize=8, loc='upper right')
+        ax.set_title('(b) Refractivity Profile', fontsize=15, fontweight='bold')
+        ax.legend(fontsize=10, loc='upper right')
         ax.grid(True, alpha=0.3)
         ax.set_xlim(left=0)
         ax.set_ylim([0, 60])
         
         if val_refrac_atm and val_refrac_atm.n_points > 0:
             stats = f'vs atmPrf: RMSE={val_refrac_atm.rmse:.1f}N, r={val_refrac_atm.correlation:.3f}'
-            ax.text(0.95, 0.05, stats, transform=ax.transAxes, fontsize=7,
+            ax.text(0.95, 0.05, stats, transform=ax.transAxes, fontsize=9,
                     ha='right', va='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         # (c) Pressure Profile
@@ -2196,14 +2202,14 @@ class PipelinePlotter:
                     has_pressure = True
         
         if has_pressure:
-            ax.legend(fontsize=8, loc='upper right')
+            ax.legend(fontsize=10, loc='upper right')
         else:
             ax.text(0.5, 0.5, 'Pressure data\nnot available', ha='center', va='center',
-                    transform=ax.transAxes, fontsize=12, color='gray')
+                    transform=ax.transAxes, fontsize=14, color='gray')
         
         ax.set_xlabel('Pressure (hPa)')
         ax.set_ylabel('Height (km)')
-        ax.set_title('(c) Pressure Profiles (P, Pw)', fontsize=11, fontweight='bold')
+        ax.set_title('(c) Pressure Profiles (P, Pw)', fontsize=15, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 40])
         
@@ -2237,14 +2243,14 @@ class PipelinePlotter:
                     has_temp = True
         
         if has_temp:
-            ax.legend(fontsize=8, loc='upper right')
+            ax.legend(fontsize=10, loc='upper right')
         else:
             ax.text(0.5, 0.5, 'Temperature data\nnot available', ha='center', va='center',
-                    transform=ax.transAxes, fontsize=12, color='gray')
+                    transform=ax.transAxes, fontsize=14, color='gray')
         
         ax.set_xlabel('Temperature (K)')
         ax.set_ylabel('Height (km)')
-        ax.set_title('(d) Temperature Profile', fontsize=11, fontweight='bold')
+        ax.set_title('(d) Temperature Profile', fontsize=15, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 40])
         

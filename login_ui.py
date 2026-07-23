@@ -40,7 +40,53 @@ VALID_PASS = "123"
 APP_TITLE = "GNSS-RO Processing"
 
 # ============================================================================
-# STYLES
+# v3.4.7 — LOGIN SCALING
+# ============================================================================
+# The login card is laid out from a single pair of scale factors so the size
+# can be re-tuned in one place.  1.0 reproduces the v3.4.6 appearance exactly.
+#
+#   LOGIN_FONT_SCALE = 1.5  -> all login text +50%   (v3.4.7 request)
+#   LOGIN_LOGO_SCALE = 2.0  -> logo 2x                (v3.4.7 request)
+#
+# Box heights are scaled at half the font rate so the card stays compact
+# enough for a 1366x768 laptop; _compute_scale() shrinks both factors further
+# if the screen is genuinely too short.
+# ============================================================================
+
+LOGIN_FONT_SCALE = 1.5
+LOGIN_LOGO_SCALE = 2.0
+
+# Card height (px) required at the nominal 1.5 / 2.0 scale.
+_CARD_HEIGHT_AT_FULL_SCALE = 660
+
+
+def _compute_scale():
+    """Return (font_scale, logo_scale), reduced on short screens.
+
+    On a 1366x768 laptop the usable height is ~728 px after the taskbar, which
+    still fits the full-scale card.  Anything shorter (e.g. 1280x720, or a
+    768 px panel with a large taskbar) scales down proportionally instead of
+    clipping the Sign In button off the bottom.
+    """
+    font_s, logo_s = LOGIN_FONT_SCALE, LOGIN_LOGO_SCALE
+    try:
+        avail = QApplication.primaryScreen().availableGeometry().height()
+    except Exception:
+        avail = 768
+    if avail < _CARD_HEIGHT_AT_FULL_SCALE + 40:
+        k = max(0.55, (avail - 40) / float(_CARD_HEIGHT_AT_FULL_SCALE))
+        font_s = 1.0 + (font_s - 1.0) * k
+        logo_s = 1.0 + (logo_s - 1.0) * k
+    return font_s, logo_s
+
+
+def _px(base, scale):
+    """Scale a pixel value and round to int."""
+    return max(1, int(round(base * scale)))
+
+
+# ============================================================================
+# STYLES  (base values = v3.4.6 sizes; multiplied by the font scale)
 # ============================================================================
 
 CARD_STYLE = """
@@ -50,13 +96,15 @@ QWidget#loginCard {
 }
 """
 
-INPUT_STYLE = """
+
+def input_style(fs):
+    return """
 QLineEdit {
     background-color: #f5f5f7;
     border: 2px solid transparent;
     border-radius: 12px;
     padding: 0 16px;
-    font-size: 14px;
+    font-size: %dpx;
     color: #1d1d1f;
     selection-background-color: #0071e3;
 }
@@ -67,15 +115,17 @@ QLineEdit:focus {
 QLineEdit:hover:!focus {
     background-color: #ebebed;
 }
-"""
+""" % _px(14, fs)
 
-BUTTON_STYLE = """
+
+def button_style(fs):
+    return """
 QPushButton {
     background-color: #0071e3;
     color: #ffffff;
     border: none;
     border-radius: 12px;
-    font-size: 15px;
+    font-size: %dpx;
     font-weight: 600;
 }
 QPushButton:hover {
@@ -87,29 +137,24 @@ QPushButton:pressed {
 QPushButton:disabled {
     background-color: #c7c7cc;
 }
-"""
+""" % _px(15, fs)
 
-ERROR_STYLE = """
-QLabel {
-    color: #ff3b30;
-    font-size: 12px;
-}
-"""
 
-TITLE_STYLE = """
-QLabel {
-    color: #1d1d1f;
-    font-size: 22px;
-    font-weight: 600;
-}
-"""
+def error_style(fs):
+    return "QLabel { color: #ff3b30; font-size: %dpx; }" % _px(12, fs)
 
-SUBTITLE_STYLE = """
-QLabel {
-    color: #86868b;
-    font-size: 13px;
-}
-"""
+
+def title_style(fs):
+    return ("QLabel { color: #1d1d1f; font-size: %dpx; font-weight: 600; }"
+            % _px(22, fs))
+
+
+def subtitle_style(fs):
+    return "QLabel { color: #86868b; font-size: %dpx; }" % _px(13, fs)
+
+
+def hint_style(fs):
+    return "QLabel { color: #c7c7cc; font-size: %dpx; }" % _px(11, fs)
 
 
 # ============================================================================
@@ -157,32 +202,53 @@ class LoginDialog(QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        # v3.4.7 — resolve the scale factors before any widget is built.
+        self.fs, self.ls = _compute_scale()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(480, 640)
+
+        # Card width follows the font scale; height is driven by the content
+        # and clamped to the available screen height.
+        self._card_w = _px(360, self.fs)
+        card_h = _px(_CARD_HEIGHT_AT_FULL_SCALE, self.fs / LOGIN_FONT_SCALE)
+        dlg_w = self._card_w + _px(120, self.fs)
+        dlg_h = card_h + 40
+        try:
+            avail = QApplication.primaryScreen().availableGeometry()
+            dlg_w = min(dlg_w, avail.width() - 40)
+            dlg_h = min(dlg_h, avail.height() - 20)
+        except Exception:
+            pass
+
+        self.setFixedSize(dlg_w, dlg_h)
         self._drag_pos = None
         self._setup_ui()
         self._center_on_screen()
-    
+
     def _setup_ui(self):
+        fs, ls = self.fs, self.ls
+
+        # Box heights grow at half the font rate so the card stays compact.
+        box_scale = 1.0 + (fs - 1.0) * 0.5
+
         # Background
         self.background = GradientBackground(self)
-        self.background.setGeometry(0, 0, 480, 640)
-        
+        self.background.setGeometry(0, 0, self.width(), self.height())
+
         # Main layout
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Center container
         center_layout = QHBoxLayout()
         center_layout.addStretch()
-        
+
         # Login card
         self.card = QWidget()
         self.card.setObjectName("loginCard")
-        self.card.setFixedWidth(360)
+        self.card.setFixedWidth(self._card_w)
         self.card.setStyleSheet(CARD_STYLE)
-        
+
         # Card shadow
         shadow = QGraphicsDropShadowEffect()
         shadow.setBlurRadius(40)
@@ -190,96 +256,107 @@ class LoginDialog(QDialog):
         shadow.setYOffset(8)
         shadow.setColor(QColor(0, 0, 0, 30))
         self.card.setGraphicsEffect(shadow)
-        
+
         card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(32, 40, 32, 40)
+        card_layout.setContentsMargins(_px(32, fs), _px(32, box_scale),
+                                       _px(32, fs), _px(32, box_scale))
         card_layout.setSpacing(0)
-        
-        # Logo
+
+        # Logo — v3.4.7: 2x the v3.4.6 size (72 px -> 144 px tall)
+        logo_h = _px(72, ls)
         self.logo_label = QLabel()
-        self.logo_label.setFixedHeight(80)
+        self.logo_label.setFixedHeight(logo_h + 8)
         self.logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
+
         if os.path.exists(LOGO_PATH):
             pixmap = QPixmap(LOGO_PATH)
-            scaled = pixmap.scaledToHeight(72, Qt.TransformationMode.SmoothTransformation)
+            scaled = pixmap.scaledToHeight(
+                logo_h, Qt.TransformationMode.SmoothTransformation)
+            # Guard: at 2x a wide logo could exceed the card's inner width.
+            max_logo_w = self._card_w - 2 * _px(32, fs)
+            if not scaled.isNull() and scaled.width() > max_logo_w:
+                scaled = pixmap.scaledToWidth(
+                    max_logo_w, Qt.TransformationMode.SmoothTransformation)
             self.logo_label.setPixmap(scaled)
         else:
-            self.logo_label.setText("🛰")
-            self.logo_label.setStyleSheet("font-size: 48px;")
-        
+            self.logo_label.setText("\U0001F6F0")
+            self.logo_label.setStyleSheet("font-size: %dpx;" % _px(48, ls))
+
         card_layout.addWidget(self.logo_label)
-        card_layout.addSpacing(16)
-        
+        card_layout.addSpacing(_px(16, box_scale))
+
         # Title
         title = QLabel(APP_TITLE)
-        title.setStyleSheet(TITLE_STYLE)
+        title.setStyleSheet(title_style(fs))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setWordWrap(True)
         card_layout.addWidget(title)
-        
+
         # Subtitle
         subtitle = QLabel("Sign in to continue")
-        subtitle.setStyleSheet(SUBTITLE_STYLE)
+        subtitle.setStyleSheet(subtitle_style(fs))
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_layout.addWidget(subtitle)
-        card_layout.addSpacing(32)
-        
+        card_layout.addSpacing(_px(24, box_scale))
+
+        field_h = _px(48, box_scale)
+
         # Username field
         self.username_input = QLineEdit()
         self.username_input.setPlaceholderText("Username")
-        self.username_input.setFixedHeight(48)
-        self.username_input.setStyleSheet(INPUT_STYLE)
+        self.username_input.setFixedHeight(field_h)
+        self.username_input.setStyleSheet(input_style(fs))
         card_layout.addWidget(self.username_input)
-        card_layout.addSpacing(12)
-        
+        card_layout.addSpacing(_px(12, box_scale))
+
         # Password field
         self.password_input = QLineEdit()
         self.password_input.setPlaceholderText("Password")
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.setFixedHeight(48)
-        self.password_input.setStyleSheet(INPUT_STYLE)
+        self.password_input.setFixedHeight(field_h)
+        self.password_input.setStyleSheet(input_style(fs))
         card_layout.addWidget(self.password_input)
-        card_layout.addSpacing(8)
-        
+        card_layout.addSpacing(_px(8, box_scale))
+
         # Error label
         self.error_label = QLabel()
-        self.error_label.setStyleSheet(ERROR_STYLE)
+        self.error_label.setStyleSheet(error_style(fs))
         self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.error_label.setFixedHeight(20)
+        self.error_label.setFixedHeight(_px(20, box_scale))
         card_layout.addWidget(self.error_label)
-        card_layout.addSpacing(16)
-        
+        card_layout.addSpacing(_px(16, box_scale))
+
         # Login button
         self.login_btn = QPushButton("Sign In")
-        self.login_btn.setFixedHeight(48)
-        self.login_btn.setStyleSheet(BUTTON_STYLE)
+        self.login_btn.setFixedHeight(field_h)
+        self.login_btn.setStyleSheet(button_style(fs))
         self.login_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.login_btn.clicked.connect(self._attempt_login)
         card_layout.addWidget(self.login_btn)
         card_layout.addStretch()
-        
+
         # Close hint
         close_hint = QLabel("Press Esc to exit")
-        close_hint.setStyleSheet("color: #c7c7cc; font-size: 11px;")
+        close_hint.setStyleSheet(hint_style(fs))
         close_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        card_layout.addSpacing(24)
+        card_layout.addSpacing(_px(14, box_scale))
         card_layout.addWidget(close_hint)
-        
+
         center_layout.addWidget(self.card)
         center_layout.addStretch()
-        
+
         wrapper = QWidget()
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.addStretch()
         wrapper_layout.addLayout(center_layout)
         wrapper_layout.addStretch()
-        
+
         layout.addWidget(wrapper)
-        
+
         # Enter key triggers login
         self.username_input.returnPressed.connect(self._focus_password)
         self.password_input.returnPressed.connect(self._attempt_login)
-    
+
     def _center_on_screen(self):
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - self.width()) // 2

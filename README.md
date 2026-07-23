@@ -55,9 +55,10 @@ satellites.
 
 | Version | Notes |
 |---|---|
+| v3.4.7 | GUI legibility pass for HD (1366x768) Windows laptops; "Mountain" ground label |
 | v3.4.5 | Fix PyInstaller module bundling on Windows 7 / Windows 10 |
 | v3.4.4.2 | UI refinements: keyboard navigation, tri-state RO classification display |
 | v3.4.4 | `.cra` non-destructive merge-save, `PROCESSING` block wired through, scatter profile plots |
 | v3.4 | RINEX auto-position, configurable constants, ranked reference selection, tangent-point curvature |
 
-See `CHANGELOG_v3.4.md` and `CHANGELOG_v3.4.4.md` for full details.
+See `CHANGELOG_v3.4.7.md`, `CHANGELOG_v3.4.4.md` and `CHANGELOG_v3.4.md` for full details.

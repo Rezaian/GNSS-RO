@@ -23,6 +23,21 @@ jobs:
           pip install pyinstaller
           pip install pyqt6 pandas numpy matplotlib scipy netCDF4 xarray
 
+      # -----------------------------------------------------------------------
+      # v3.4.7 additions:
+      #
+      #   plot_style                        - NEW module (central plot font
+      #                                       sizing). Reached only from
+      #                                       function-level imports inside
+      #                                       the plotting routines, and used
+      #                                       from 'spawn' child processes.
+      #                                       Declared explicitly so neither
+      #                                       depends on static analysis.
+      #
+      #   matplotlib.backends.backend_qtagg - the backend the code actually
+      #                                       uses (gnss_ro_gui.py calls
+      #                                       matplotlib.use('QtAgg')).
+      # -----------------------------------------------------------------------
       - name: Build macOS app
         run: |
           pyinstaller \
@@ -33,6 +48,7 @@ jobs:
             --add-data "assets:assets" \
             --hidden-import "qt_compat" \
             --hidden-import "login_ui" \
+            --hidden-import "plot_style" \
             --hidden-import "ground_gnss_ro_pipeline" \
             --hidden-import "sat_gnss_ro_pipeline" \
             --hidden-import "rinex_parser" \
@@ -73,8 +89,12 @@ jobs:
       # Pinned package versions that ship Python 3.8 wheels and are known to
       # work on Windows 7 SP1 (no updates since 2020) and Windows 10 LTSC 2019.
       #
-      # PyQt6 requires Windows 10+ — we use PyQt5 for the Windows build.
+      # PyQt6 requires Windows 10+ - we use PyQt5 for the Windows build.
       # qt_compat.py already handles the PyQt5/PyQt6 fallback transparently.
+      #
+      # matplotlib 3.7.5 provides backend_qtagg, which is binding-agnostic and
+      # resolves to the PyQt5 implementation at run time. This is why the code
+      # can call matplotlib.use('QtAgg') on a PyQt5-only build.
       # -----------------------------------------------------------------------
       - name: Install dependencies
         run: |
@@ -91,20 +111,36 @@ jobs:
       # -----------------------------------------------------------------------
       # Key changes vs the broken build:
       #
-      # 1. qt_compat, login_ui, ground_gnss_ro_pipeline, sat_gnss_ro_pipeline,
-      #    and rinex_parser are Python MODULES → use --hidden-import, NOT
-      #    --add-data.  --add-data copies raw bytes into _MEIPASS but does NOT
-      #    make them importable; --hidden-import tells PyInstaller to compile
-      #    and bundle them as proper .pyc entries on sys.path.
+      # 1. qt_compat, login_ui, plot_style, ground_gnss_ro_pipeline,
+      #    sat_gnss_ro_pipeline, and rinex_parser are Python MODULES -> use
+      #    --hidden-import, NOT --add-data.  --add-data copies raw bytes into
+      #    _MEIPASS but does NOT make them importable; --hidden-import tells
+      #    PyInstaller to compile and bundle them as proper .pyc entries on
+      #    sys.path.
       #
       # 2. gnss_ro_gui.py itself now injects sys._MEIPASS into sys.path[0]
       #    when frozen, so every subsequent local import resolves correctly
       #    even on edge-case Windows builds where PyInstaller's automatic
       #    path wiring is incomplete.
       #
-      # 3. matplotlib backend is backend_qt5agg (matching PyQt5).
+      # 3. matplotlib backend.  v3.4.7 correction: this job previously
+      #    declared ONLY backend_qt5agg, but gnss_ro_gui.py calls
+      #    matplotlib.use('QtAgg') and imports backend_qtagg - a different
+      #    module.  The build still worked because backend_qtagg is a
+      #    top-level import that PyInstaller finds statically, but the
+      #    declared hidden import was protecting the wrong thing.  Both are
+      #    now listed: backend_qtagg is what the code asks for, backend_qt5agg
+      #    is what it ultimately delegates to under PyQt5.
       #
-      # 4. assets/ is still --add-data because those are data files, not
+      # 4. plot_style (v3.4.7) is reached only from function-level imports
+      #    inside the plotting routines, and is used from the 'spawn'
+      #    multiprocessing children.  PyInstaller's modulegraph does walk
+      #    function-level imports, so this is belt-and-braces rather than
+      #    strictly required - but it costs nothing and removes any doubt
+      #    about the frozen app raising ModuleNotFoundError the first time
+      #    it draws a panel.
+      #
+      # 5. assets/ is still --add-data because those are data files, not
       #    Python modules (semicolon separator = Windows convention).
       # -----------------------------------------------------------------------
       - name: Build Windows exe
@@ -116,12 +152,14 @@ jobs:
             --add-data "assets;assets" `
             --hidden-import "qt_compat" `
             --hidden-import "login_ui" `
+            --hidden-import "plot_style" `
             --hidden-import "ground_gnss_ro_pipeline" `
             --hidden-import "sat_gnss_ro_pipeline" `
             --hidden-import "rinex_parser" `
             --hidden-import "PyQt5.QtWidgets" `
             --hidden-import "PyQt5.QtCore" `
             --hidden-import "PyQt5.QtGui" `
+            --hidden-import "matplotlib.backends.backend_qtagg" `
             --hidden-import "matplotlib.backends.backend_qt5agg" `
             gnss_ro_gui.py
 
@@ -161,4 +199,3 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

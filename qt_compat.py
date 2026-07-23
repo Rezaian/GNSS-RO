@@ -12,7 +12,7 @@ try:
         QToolButton, QSizePolicy, QFrame
     )
     from PyQt6.QtCore import (
-        Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint
+        Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize
     )
     from PyQt6.QtGui import (
         QColor, QFont, QPixmap, QPainter, QLinearGradient, QBrush
@@ -30,7 +30,7 @@ except ImportError:
         QToolButton, QSizePolicy, QFrame
     )
     from PyQt5.QtCore import (
-        Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint
+        Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize
     )
     from PyQt5.QtGui import (
         QColor, QFont, QPixmap, QPainter, QLinearGradient, QBrush

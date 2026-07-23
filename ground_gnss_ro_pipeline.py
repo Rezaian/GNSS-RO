@@ -3123,8 +3123,11 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
     try:
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
+        from plot_style import apply_plot_fonts
     except ImportError:
         return False
+
+    apply_plot_fonts()   # v3.4.7 — larger tick / axis / legend text
 
     if sat_data.empty:
         return False
@@ -3134,7 +3137,7 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
         df['utc_parsed'] = pd.to_datetime(df['utc'], errors='coerce')
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'GNSS Raw Observations: {sat_id}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'GNSS Raw Observations: {sat_id}', fontsize=18, fontweight='bold')
     elev_col = 'accurate_elevation' if 'accurate_elevation' in df.columns else 'elevation'
 
     ax = axes[0, 0]
@@ -3190,9 +3193,9 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
             ax.axhline(y=-RO_DOPPLER_THRESHOLD, color='#D32F2F', linestyle='--', alpha=0.7, linewidth=1)
             
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-            ax.legend(fontsize=7, markerscale=2, loc='best')
+            ax.legend(fontsize=9, markerscale=2, loc='best')
     ax.set_xlabel('UTC Time'); ax.set_ylabel('Atmospheric Doppler (Hz)')
-    ax.set_title('(a) Atmospheric Doppler', fontsize=11, fontweight='bold'); ax.grid(True, alpha=0.3)
+    ax.set_title('(a) Atmospheric Doppler', fontsize=15, fontweight='bold'); ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
     if 'cno' in df.columns and 'accurate_elevation' in df.columns and 'sigID' in df.columns:
@@ -3202,9 +3205,9 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
             for i, sig in enumerate(valid['sigID'].unique()):
                 subset = valid[valid['sigID'] == sig]
                 ax.scatter(subset['accurate_elevation'], subset['cno'], s=3, alpha=0.6, c=colors[i % 3], label=sig)
-            ax.legend(fontsize=7, markerscale=2, loc='lower right')
+            ax.legend(fontsize=9, markerscale=2, loc='lower right')
     ax.set_xlabel('Accurate Elevation (°)'); ax.set_ylabel('C/N₀ (dB-Hz)')
-    ax.set_title('(b) Signal Strength vs Elevation', fontsize=11, fontweight='bold'); ax.grid(True, alpha=0.3)
+    ax.set_title('(b) Signal Strength vs Elevation', fontsize=15, fontweight='bold'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
     if elev_col in df.columns and 'utc_parsed' in df.columns:
@@ -3214,7 +3217,7 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
             ax.axhline(y=RO_ELEVATION_THRESHOLD, color='#D32F2F', linestyle='--', alpha=0.7, linewidth=1)
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     ax.set_xlabel('UTC Time'); ax.set_ylabel('Elevation (°)')
-    ax.set_title('(c) Satellite Elevation', fontsize=11, fontweight='bold'); ax.grid(True, alpha=0.3)
+    ax.set_title('(c) Satellite Elevation', fontsize=15, fontweight='bold'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
     if 'doppler' in df.columns and 'utc_parsed' in df.columns and 'sigID' in df.columns:
@@ -3224,10 +3227,10 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
             for i, sig in enumerate(valid['sigID'].unique()):
                 subset = valid[valid['sigID'] == sig]
                 ax.scatter(subset['utc_parsed'], subset['doppler'], s=3, alpha=0.6, c=colors[i % 3], label=sig)
-            ax.legend(fontsize=7, markerscale=2, loc='lower right')
+            ax.legend(fontsize=9, markerscale=2, loc='lower right')
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     ax.set_xlabel('UTC Time'); ax.set_ylabel('Measured Doppler (Hz)')
-    ax.set_title('(d) Raw Doppler', fontsize=11, fontweight='bold'); ax.grid(True, alpha=0.3)
+    ax.set_title('(d) Raw Doppler', fontsize=15, fontweight='bold'); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='white')
@@ -3288,11 +3291,14 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
     """
     try:
         import matplotlib.pyplot as plt
+        from plot_style import apply_plot_fonts
     except ImportError:
         return False
 
+    apply_plot_fonts()   # v3.4.7 — larger tick / axis / legend text
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Derived Profiles: {sat_id}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'Derived Profiles: {sat_id}', fontsize=18, fontweight='bold')
 
     # v3.4.4: scatter (not line) for retrieved profiles — line plots in height
     # space connect outliers and visually corrupt the panel. Markers leave
@@ -3319,7 +3325,7 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         if 'bending_angle_rad' in df.columns:
             ax.scatter(np.degrees(df['bending_angle_rad']), df[y_col],
                        c='g', label='Iono-free', **sct_kw)
-        ax.legend(fontsize=8, loc='upper right')
+        ax.legend(fontsize=10, loc='upper right')
     else:
         y_label = 'Geometric Height, a/n − Rₑ (km)'
     # Station height as upper bound for retrieved profile
@@ -3327,10 +3333,10 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         station_alt_km = station_altitude / 1000.0
         ax.axhline(y=station_alt_km, color='#4CAF50', linestyle=':', linewidth=1.5, alpha=0.8,
                    label=f'Station height ({station_alt_km:.2f} km)')
-        ax.legend(fontsize=8, loc='upper right')
+        ax.legend(fontsize=10, loc='upper right')
     ax.set_xlabel('Bending Angle (°)')
     ax.set_ylabel(y_label)
-    ax.set_title('(a) Bending Angle', fontsize=11, fontweight='bold')
+    ax.set_title('(a) Bending Angle', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
 
@@ -3341,14 +3347,14 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         df = pd.read_csv(comp_csv)
         ax.scatter(df['N_RO'], df['height_km'], c='r', label='RO Retrieved', **sct_kw)
         ax.scatter(df['N_ERA5'], df['height_km'], c='b', marker='x', s=10, alpha=0.7, label='ERA5')
-        ax.legend(fontsize=9, loc='upper right')
+        ax.legend(fontsize=11, loc='upper right')
     elif refrac_csv and os.path.exists(refrac_csv):
         df = pd.read_csv(refrac_csv)
         ax.scatter(df['refractivity_N'], df['height_km'], c='r', label='RO Retrieved', **sct_kw)
-        ax.legend(fontsize=9, loc='upper right')
+        ax.legend(fontsize=11, loc='upper right')
     ax.set_xlabel('Refractivity (N-units)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(b) Refractivity', fontsize=11, fontweight='bold')
+    ax.set_title('(b) Refractivity', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
 
@@ -3360,13 +3366,13 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
             pct_error = ((df['N_RO'] - df['N_ERA5']) / df['N_ERA5']) * 100
             ax.scatter(pct_error, df['height_km'], c='m', label='% Error', **sct_kw)
             ax.axvline(x=0, color='k', linestyle='-', linewidth=0.5, alpha=0.5)
-            ax.legend(fontsize=9, loc='upper right')
+            ax.legend(fontsize=11, loc='upper right')
     else:
         ax.text(0.5, 0.5, 'Requires ERA5\ncomparison data',
-                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+                ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
     ax.set_xlabel('Refractivity Error (%)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(c) Refractivity % Error', fontsize=11, fontweight='bold')
+    ax.set_title('(c) Refractivity % Error', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     # (d) Specific Humidity
@@ -3378,13 +3384,13 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
             ax.scatter(df['specific_humidity_g_kg'], df['height_km'], c='c', label='q (RO)', **sct_kw)
         if 'q_era5' in df.columns:
             ax.scatter(df['q_era5'], df['height_km'], c='c', marker='x', s=10, alpha=0.6, label='q (ERA5)')
-        ax.legend(fontsize=9, loc='upper right')
+        ax.legend(fontsize=11, loc='upper right')
     else:
         ax.text(0.5, 0.5, 'Requires atmospheric\nretrieval data',
-                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+                ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
     ax.set_xlabel('Specific Humidity (g/kg)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(d) Specific Humidity', fontsize=11, fontweight='bold')
+    ax.set_title('(d) Specific Humidity', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -3402,11 +3408,14 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
     """
     try:
         import matplotlib.pyplot as plt
+        from plot_style import apply_plot_fonts
     except ImportError:
         return False
 
+    apply_plot_fonts()   # v3.4.7 — larger tick / axis / legend text
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Atmospheric Profiles: {sat_id}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'Atmospheric Profiles: {sat_id}', fontsize=18, fontweight='bold')
 
     # v3.4.4: scatter (not line) for retrieved profiles.
     sct_kw = dict(s=8, alpha=0.7, edgecolors='none')
@@ -3421,10 +3430,10 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
             ax.scatter(df['pressure_hPa'], df['height_km'], c='r', label='P (RO)', **sct_kw)
         if 'P_era5' in df.columns:
             ax.scatter(df['P_era5'], df['height_km'], c='r', marker='x', s=10, alpha=0.6, label='P (ERA5)')
-        ax.legend(fontsize=9, loc='upper right')
+        ax.legend(fontsize=11, loc='upper right')
     ax.set_xlabel('Pressure (hPa)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(a) Pressure', fontsize=11, fontweight='bold')
+    ax.set_title('(a) Pressure', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     # (b) Water Vapor Pressure Profile
@@ -3435,10 +3444,10 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
             ax.scatter(df['water_vapor_hPa'], df['height_km'], c='b', label='Pw (RO)', **sct_kw)
         if 'Pw_era5' in df.columns:
             ax.scatter(df['Pw_era5'], df['height_km'], c='b', marker='x', s=10, alpha=0.6, label='Pw (ERA5)')
-        ax.legend(fontsize=9, loc='upper right')
+        ax.legend(fontsize=11, loc='upper right')
     ax.set_xlabel('Water Vapor Pressure (hPa)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(b) Water Vapor Pressure', fontsize=11, fontweight='bold')
+    ax.set_title('(b) Water Vapor Pressure', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     # (c) Relative Humidity (computed from Pw and T)
@@ -3456,16 +3465,16 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
                 RH_era5 = RH_era5.clip(0, 100)
                 ax.scatter(RH_era5, df['height_km'], c='#8E24AA', marker='x',
                            s=10, alpha=0.6, label='RH (ERA5)')
-            ax.legend(fontsize=9, loc='upper right')
+            ax.legend(fontsize=11, loc='upper right')
         else:
             ax.text(0.5, 0.5, 'Requires Pw and T\ndata for RH', 
-                    ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+                    ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
     else:
         ax.text(0.5, 0.5, 'Requires atmospheric\nretrieval data', 
-                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+                ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
     ax.set_xlabel('Relative Humidity (%)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(c) Relative Humidity', fontsize=11, fontweight='bold')
+    ax.set_title('(c) Relative Humidity', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     # (d) Temperature Profile - IN CELSIUS
@@ -3475,16 +3484,16 @@ def generate_atmospheric_plots(sat_results: Dict[str, Any], sat_id: str, output_
         if 'T_era5' in df.columns:
             temp_celsius = df['T_era5'] - 273.15
             ax.scatter(temp_celsius, df['height_km'], c='g', label='T (ERA5)', **sct_kw)
-            ax.legend(fontsize=9, loc='upper right')
+            ax.legend(fontsize=11, loc='upper right')
         else:
             ax.text(0.5, 0.5, 'Temperature data\nnot available', 
-                    ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+                    ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
     else:
         ax.text(0.5, 0.5, 'Requires ERA5 data', 
-                ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+                ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
     ax.set_xlabel('Temperature (°C)')
     ax.set_ylabel('Geometric Height, a/n − Rₑ (km)')
-    ax.set_title('(d) Temperature (ERA5)', fontsize=11, fontweight='bold')
+    ax.set_title('(d) Temperature (ERA5)', fontsize=15, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
