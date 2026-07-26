@@ -3031,7 +3031,7 @@ def retrieve_atmospheric_profile(refractivity_csv: str, era5_file: str,
         return ProcessingResult(False, None, f"Cannot open ERA5 file: {e}", {})
 
     try:
-        T_era5_da, z_era5_da, q_era5_da, fallback = _era5_extract(ds, lat, lon)
+        T_era5_da, q_era5_da, z_era5_da, fallback = _era5_extract(ds, lat, lon)
         P_levels = ds['pressure_level'].values
     except Exception as e:
         ds.close()
