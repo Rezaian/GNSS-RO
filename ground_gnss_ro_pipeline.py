@@ -1273,14 +1273,6 @@ Fixed based on Document 2's working implementation
 GPS_LEAP_SECONDS = 18.0
 
 
-@dataclass
-class ProcessingResult:
-    success: bool
-    data: Optional[pd.DataFrame]
-    message: str
-    metadata: Dict
-
-
 class SP3Parser:
     """High-precision SP3 parser with microsecond-level interpolation support"""
     
@@ -1846,9 +1838,18 @@ def apply_single_differencing(
             ref_sat = None
             ref_type = None
             
+            # v3.4.9: only rows with finite excess Doppler AND elevation can act
+            # as a reference. Signals with no measured Doppler (e.g. RINEX codes
+            # that carry C/L but no D) are all-NaN here; using them as a
+            # reference made idxmax() return NaN -> KeyError(nan) ("CRITICAL ERROR: nan").
+            ref_pool = epoch_data[np.isfinite(epoch_data['excess_doppler'].values) &
+                                  np.isfinite(epoch_data[elev_col].values)]
+            if ref_pool.empty:
+                continue   # nothing usable this epoch; atmos_doppler stays NaN
+
             # Try primary reference first
             if primary_ref is not None:
-                primary_data = epoch_data[epoch_data['sat_id'] == primary_ref]
+                primary_data = ref_pool[ref_pool['sat_id'] == primary_ref]
                 if not primary_data.empty and primary_data[elev_col].iloc[0] >= reference_elevation_threshold:
                     ref_doppler = primary_data['excess_doppler'].iloc[0]
                     ref_sat = primary_ref
@@ -1857,18 +1858,18 @@ def apply_single_differencing(
             # Fallback: elevation-weighted average
             if ref_doppler is None:
                 ref_doppler, ref_sat = _compute_weighted_reference(
-                    epoch_data, 
-                    elev_col, 
+                    ref_pool,
+                    elev_col,
                     reference_elevation_threshold
                 )
                 if ref_doppler is not None:
                     ref_type = 'weighted_avg'
-            
+
             # Last resort: highest elevation satellite
             if ref_doppler is None:
-                highest_idx = epoch_data[elev_col].idxmax()
-                ref_doppler = epoch_data.loc[highest_idx, 'excess_doppler']
-                ref_sat = epoch_data.loc[highest_idx, 'sat_id']
+                highest_idx = ref_pool[elev_col].idxmax()
+                ref_doppler = ref_pool.loc[highest_idx, 'excess_doppler']
+                ref_sat = ref_pool.loc[highest_idx, 'sat_id']
                 ref_type = 'highest_elev'
             
             # Apply differencing
@@ -1925,6 +1926,10 @@ def _select_primary_reference(
         # Must have sufficient epochs
         if n_epochs < min_epochs:
             continue
+
+        # v3.4.9: must have enough FINITE excess Doppler to be scored at all
+        if np.isfinite(sat_data['excess_doppler'].values).sum() < min_epochs:
+            continue
         
         # Compute stability metrics
         excess_std = sat_data['excess_doppler'].std()
@@ -1966,6 +1971,9 @@ def _select_primary_reference(
         (1 - cdf['n_jumps'] / (cdf['n_jumps'].max() + 1)) * 2.0  # Weight: 2 (fewer jumps better)
     )
     
+    cdf = cdf[np.isfinite(cdf['score'].values)]
+    if cdf.empty:
+        return None
     best = cdf.loc[cdf['score'].idxmax()]
     return best['sat_id']
 

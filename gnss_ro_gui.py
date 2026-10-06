@@ -795,9 +795,11 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
         progress_queue.put(('done', 'ground', True, f"{success_count}/{len(results)} steps completed", diff_csv))
         
     except Exception as e:
-        log(f"CRITICAL ERROR: {str(e)}")
+        import traceback
+        log(f"CRITICAL ERROR: {type(e).__name__}: {str(e)}")
+        log(f"TRACEBACK:\n{traceback.format_exc()}")
         write_log()
-        progress_queue.put(('done', 'ground', False, str(e), None))
+        progress_queue.put(('done', 'ground', False, f"{type(e).__name__}: {e}", None))
 
 
 # ============================================================================
