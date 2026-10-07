@@ -445,7 +445,7 @@ class RINEXParser:
         current_epoch = None
         current_gps_time = None
         current_utc_time = None
-        epoch_tow = None  # Time of week in milliseconds
+        epoch_tow = None  # Time of week in seconds
         
         while i < len(lines):
             line = lines[i]
@@ -503,8 +503,10 @@ class RINEXParser:
                     # Python weekday: Monday=0, Sunday=6
                     # GPS week: Sunday=0, Monday=1, ..., Saturday=6
                     days_since_sunday = (current_epoch.weekday() + 1) % 7
-                    epoch_tow = int((days_since_sunday * 86400 + hour * 3600 + 
-                                    minute * 60 + second) * 1000)
+                    # Time of week in SECONDS (same unit as the UBX parser's rcvTow).
+                    # Rounded to 0.1 ms so 20 Hz epochs keep exact spacing.
+                    epoch_tow = round(days_since_sunday * 86400 + hour * 3600 +
+                                      minute * 60 + second, 4)
                     
                     # Store GPS time for reference
                     current_gps_time = current_epoch
@@ -612,6 +614,7 @@ class RINEXParser:
                 pseudo = signal_obs.get('C', {}).get('value', '')
                 doppler = signal_obs.get('D', {}).get('value', '')
                 cno = signal_obs.get('S', {}).get('value', '')
+                lli = signal_obs.get('L', {}).get('lli', None)
                 
                 # Only create record if we have at least one meaningful observation
                 # (pseudorange, carrier phase, or doppler)
@@ -630,6 +633,10 @@ class RINEXParser:
                         'doppler': doppler,
                         'codePhase': '',
                         'cno': cno,
+                        # loss-of-lock indicator of the phase (bit 0 = cycle slip possible)
+                        'lli': lli if lli is not None else '',
+                        # GLONASS FDMA channel from the 'GLONASS SLOT / FRQ #' header
+                        'glo_k': self.glonass_slots.get(prn, '') if sys_code == 'R' else '',
                     }
                     self.observations.append(record)
             
@@ -647,8 +654,9 @@ class RINEXParser:
     
     def to_csv(self, output_path):
         """Write observations to CSV file."""
-        fieldnames = ['timestamp', 'gpsTime', 'utc', 'gnssId', 'svId', 'sigId', 'elevation', 
-                      'azimuth', 'carrierPhase', 'pseudorange', 'doppler', 'codePhase', 'cno']
+        fieldnames = ['timestamp', 'gpsTime', 'utc', 'gnssId', 'svId', 'sigId', 'elevation',
+                      'azimuth', 'carrierPhase', 'pseudorange', 'doppler', 'codePhase', 'cno',
+                      'lli', 'glo_k']
         
         with open(output_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)

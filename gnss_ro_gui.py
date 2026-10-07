@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GNSS Radio Occultation Processing GUI
-==========================================
+GNSS Radio Occultation Processing GUI  3.5.2
+==============================================
 
 Supports both ground-based and satellite-based (LEO) GNSS-RO processing.
 
@@ -15,6 +15,9 @@ Features:
 
 import sys
 import os
+
+__version__ = "3.5.2"
+import re
 import json
 import glob
 from datetime import datetime
@@ -63,6 +66,8 @@ from ground_gnss_ro_pipeline import (
     apply_single_differencing, retrieve_bending_angles,
     retrieve_refractivity, compare_with_era5, retrieve_atmospheric_profile,
     PROCESSING_DEFAULTS, load_processing_config_from_cra, apply_processing_config,
+    extract_station_info,
+    session_quality, session_quality_lines, load_ro_checks,
 )
 
 from sat_gnss_ro_pipeline import (
@@ -78,6 +83,40 @@ from matplotlib.figure import Figure
 import multiprocessing as mp
 from multiprocessing import Process, Queue
 from login_ui import LoginDialog
+
+# 3.5.2 — QMenu (Recent folders) from the SAME Qt binding qt_compat uses
+QMenu = None
+try:
+    from qt_compat import QMenu                      # if qt_compat exports it
+except ImportError:
+    try:
+        QMenu = __import__(QWidget.__module__, fromlist=['QMenu']).QMenu
+    except Exception:
+        QMenu = None
+
+# 3.5.2 — remembered folders (last + recent), per user
+PREFS_FILE = os.path.join(os.path.expanduser('~'), '.gnss_ro_gui.json')
+
+
+def _load_prefs() -> Dict[str, Any]:
+    try:
+        with open(PREFS_FILE) as f:
+            p = json.load(f)
+        return p if isinstance(p, dict) else {}
+    except Exception:
+        return {}
+
+
+def _remember_dir(directory: str):
+    p = _load_prefs()
+    rec = [d for d in p.get('recent', []) if d != directory and os.path.isdir(d)]
+    p['recent'] = [directory] + rec[:7]
+    p['last_dir'] = directory
+    try:
+        with open(PREFS_FILE, 'w') as f:
+            json.dump(p, f, indent=1)
+    except OSError:
+        pass
 
 
 # ============================================================================
@@ -135,6 +174,16 @@ class DataType:
     GROUND = 1
     SATELLITE = 2
     BOTH = 3
+
+def _wrap_reason(reason: str, width: int = 60) -> str:
+    import textwrap
+    return "\n".join(textwrap.wrap(reason or "no reason recorded", width))
+
+
+def geodetic_to_ecef_gui(lat_deg: float, lon_deg: float, h_m: float):
+    from ground_gnss_ro_pipeline import geodetic_to_ecef
+    return geodetic_to_ecef(lat_deg, lon_deg, h_m)
+
 
 def scan_input_directory(directory: str) -> Dict[str, Any]:
     """
@@ -197,9 +246,11 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
         # Determine observation source
         if ubx_files:
             result['obs_source'] = 'UBX'
+            result['n_obs'] = len(ubx_files)
             result['info'].append(f"Ground data: {len(ubx_files)} UBX files")
         else:
             result['obs_source'] = 'RNX'
+            result['n_obs'] = len(rnx_files)
             result['info'].append(f"Ground data: {len(rnx_files)} RINEX files")
         
         # If both exist, note UBX will be preferred
@@ -207,7 +258,8 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
             result['info'].append(f"Note: {len(rnx_files)} RINEX files also found (UBX preferred)")
         
         if not metadata_files:
-            result['info'].append("No metadata.cra — will read station position from RINEX header")
+            result['info'].append("No metadata.cra — station from the receiver (UBX 3D fix / RINEX header), "
+                                  "settings from defaults; metadata.cra will be created on run")
         
         if len(sp3_files) > 1:
             result['warnings'].append(f"Multiple SP3 files — using {os.path.basename(sp3_files[0])}")
@@ -218,9 +270,9 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
                           or not any(x in os.path.basename(f).lower() for x in ['atmprf', 'wetpf', 'conphs'])]
         if era5_candidates:
             result['era5_file'] = era5_candidates[0]
-            result['info'].append(f"ERA5 validation: {os.path.basename(era5_candidates[0])}")
+            result['info'].append(f"Validation .nc: {os.path.basename(era5_candidates[0])}")
         else:
-            result['warnings'].append("No ERA5 data — ground validation limited")
+            result['warnings'].append("No .nc file — ground validation limited")
     
     # === Check for SATELLITE data ===
     conphs_files = sorted(
@@ -258,17 +310,41 @@ def scan_input_directory(directory: str) -> Dict[str, Any]:
         result['valid'] = True
     else:
         result['errors'].append("No valid GNSS-RO data found")
-        result['errors'].append("Ground requires: (.ubx OR .rnx) + .sp3 (metadata.cra optional if RINEX has station position)")
+        result['errors'].append("Ground requires: (.ubx OR .rnx) + .sp3 (metadata.cra optional: station is read from the receiver data)")
         result['errors'].append("Satellite requires: conPhs_* files")
     
     return result
 
+CRA_PARSE_NOTES: Dict[str, str] = {}
+
+
 def load_metadata(filepath: str) -> Optional[Dict]:
+    """
+    Read metadata.cra (JSON). v4.5: tolerant of the usual hand-editing slips -
+    an emptied value ("STATION_LAT": ,) or a trailing comma - so a half-filled
+    file still yields its station name and settings. A repaired read is noted
+    in CRA_PARSE_NOTES[filepath] for the GUI to show.
+    """
+    CRA_PARSE_NOTES.pop(filepath, None)
     try:
-        with open(filepath, 'r') as f:
-            return json.load(f)
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
+            text = f.read()
     except Exception:
         return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    fixed = re.sub(r':\s*(?=[,}\]])', ': null', text)          # "KEY": ,   ->  "KEY": null,
+    fixed = re.sub(r',\s*(?=[}\]])', '', fixed)                # trailing commas
+    try:
+        data = json.loads(fixed)
+        CRA_PARSE_NOTES[filepath] = "metadata.cra is not valid JSON (empty value or trailing comma) - read it after a repair"
+        return data
+    except Exception:
+        name = re.search(r'"STATION_NAME"\s*:\s*"([^"]*)"', text)
+        CRA_PARSE_NOTES[filepath] = "metadata.cra could not be read as JSON - only the station name was recovered"
+        return {'STATION_NAME': name.group(1)} if name else None
 
 
 def save_metadata(filepath: str, data: Dict) -> bool:
@@ -279,6 +355,14 @@ def save_metadata(filepath: str, data: Dict) -> bool:
         return True
     except Exception:
         return False
+
+
+# Keys written by GUI <= v3.4.7 under names the pipeline does not know; they
+# never had any effect and are purged on the next save.
+LEGACY_PROCESSING_KEYS = (
+    'POLY_SMOOTH_WINDOW_S', 'POLYFIT_GAP_THRESHOLD_S', 'RO_ELEVATION_THRESHOLD_DEG',
+    'RO_DOPPLER_THRESHOLD_HZ', 'REF_SAT_ELEVATION_THRESHOLD_DEG', 'REF_SAT_JUMP_THRESHOLD_HZ',
+)
 
 
 def merge_save_metadata(filepath: str, station_fields: Dict,
@@ -313,6 +397,10 @@ def merge_save_metadata(filepath: str, station_fields: Dict,
             proc = {}
         for k, v in processing_fields.items():
             proc[k] = v
+        # v4.3: remove keys written by older GUI versions that the pipeline never
+        # read (e.g. POLY_SMOOTH_WINDOW_S). Their real counterparts are kept.
+        for k in LEGACY_PROCESSING_KEYS:
+            proc.pop(k, None)
         existing['PROCESSING'] = proc
 
     try:
@@ -486,6 +574,87 @@ def classify_ground_ro_status(ground_dir: str,
     return out
 
 
+RO_OK_1F = 'ro_ok_1f'  # amber — RO + profile, single frequency (no ionospheric correction)
+
+
+def build_ground_status(ground_dir: str, step4_df: Optional[pd.DataFrame] = None):
+    """
+    v4.3: results-list state per item, read from what step 5 wrote.
+
+    Returns (status, reasons):
+      status  {item_id: 'ro_ok' | 'ro_ok_1f' | 'ro_empty' | False}
+              item_id is the occultation event id (GPS_7 or GPS_7_e2) for events,
+              the satellite id otherwise
+      reasons {item_id: text} for 'ro_empty' rows (why no profile)
+    Falls back to the legacy evaluation for outputs written by older versions.
+    """
+    status: Dict[str, Any] = {}
+    reasons: Dict[str, str] = {}
+    bending_dir = os.path.join(ground_dir, 'bending')
+    summary_csv = os.path.join(bending_dir, 'summary.csv')
+    skipped_csv = os.path.join(bending_dir, 'skipped.csv')
+    if step4_df is None:
+        step4 = os.path.join(ground_dir, 'step4_differenced.csv')
+        step4_df = pd.read_csv(step4, usecols=lambda c: c in ('sat_id', 'gnssId', 'svId')) \
+            if os.path.exists(step4) else pd.DataFrame()
+    sats = []
+    if not step4_df.empty:
+        if 'sat_id' not in step4_df.columns:
+            step4_df = step4_df.assign(sat_id=step4_df['gnssId'].astype(str) + '_' + step4_df['svId'].astype(str))
+        sats = list(step4_df['sat_id'].unique())
+
+    if not os.path.exists(skipped_csv):           # output from an older version
+        try:
+            return classify_ground_ro_status(ground_dir, evaluate_ro_status(step4_df)), {}
+        except Exception:
+            return {s: NO_RO for s in sats}, {}
+
+    with_event = set()
+    if os.path.exists(summary_csv):
+        try:
+            summ = pd.read_csv(summary_csv)
+        except Exception:
+            summ = pd.DataFrame()
+        for _, r in summ.iterrows():
+            ev = str(r['sat_id'])
+            ok = _has_usable_bending_data(os.path.join(bending_dir, f'{ev}_bending.csv'))
+            single = str(r.get('freq_mode', 'dual')) == 'single'
+            status[ev] = (RO_OK_1F if single else RO_OK) if ok else RO_EMPTY
+            if not ok:
+                reasons[ev] = 'bending file has no finite values'
+            with_event.add(ev.split('_e')[0] if '_e' in ev else ev)
+    try:
+        skp = pd.read_csv(skipped_csv)
+    except Exception:
+        skp = pd.DataFrame(columns=['sat_id', 'reason'])
+    for _, r in skp.iterrows():
+        sid = str(r['sat_id'])
+        status[sid] = RO_EMPTY
+        reasons[sid] = str(r['reason'])
+        with_event.add(sid.split('_e')[0] if '_e' in sid else sid)
+    for sid in sats:
+        if sid not in with_event and sid not in status:
+            status[sid] = NO_RO
+    return status, reasons
+
+
+def ground_hidden_items(ground_dir: Optional[str], status: Dict[str, Any]) -> set:
+    """3.5.2: items that never went below the RO elevation threshold (test 1) -
+    hidden from the Results list unless 'Show all' is ticked."""
+    hidden = set()
+    if not ground_dir:
+        return hidden
+    bdir = os.path.join(ground_dir, 'bending')
+    for k, v in status.items():
+        if _norm_ground_state(v) != 'no_ro':
+            continue
+        info = load_ro_checks(bdir, k)
+        f = next((c for c in (info or {}).get('checks', []) if c.get('passed') is False), None)
+        if f and f.get('name') == 'Tracked below 5° elevation':
+            hidden.add(k)
+    return hidden
+
+
 def load_ground_ro_status_from_csv(ground_dir: str) -> Dict[str, Any]:
     """Reconstruct {sat_id: ro_state} from saved artefacts.
 
@@ -497,19 +666,9 @@ def load_ground_ro_status_from_csv(ground_dir: str) -> Dict[str, Any]:
     if not os.path.exists(step4):
         return {}
     try:
-        df = pd.read_csv(step4)
+        return build_ground_status(ground_dir)[0]
     except Exception:
         return {}
-    if 'sat_id' not in df.columns:
-        if 'gnssId' in df.columns and 'svId' in df.columns:
-            df['sat_id'] = df['gnssId'].astype(str) + '_' + df['svId'].astype(str)
-        else:
-            return {}
-    try:
-        bool_status = evaluate_ro_status(df)
-    except Exception:
-        return {}
-    return classify_ground_ro_status(ground_dir, bool_status)
 
 
 def load_sat_summary_from_csv(sat_dir: str) -> Optional[pd.DataFrame]:
@@ -559,244 +718,170 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
                         era5_file: str, output_dir: str, progress_queue: Queue,
                         processing_cfg: Optional[dict] = None,
                         keep_intermediate: bool = False):
-    """Ground-based pipeline execution in separate process.
+    """Ground-based pipeline in a separate process.
 
-    v3.4.4: accepts a PROCESSING config dict that is applied to the pipeline
-    module's constants in this child process, and a keep_intermediate flag
-    that controls deletion of step1/2/3 CSVs at the end of a successful run.
+    v4.3: runs the pipeline's own GNSSROPipeline.run_full_pipeline instead of a
+    copy of the steps, so the GUI gets everything the pipeline does: receiver
+    position (UBX 3D fix / RINEX header) unless FORCE_CRA_STATION_COORDS,
+    station n_r and pressure from ERA5 when no met data, Fresnel-adaptive
+    smoothing, occultation events, ERA5 at the occultation time, the station
+    barometer as the step-7 boundary, and single-frequency events when enabled.
+    ``processing_cfg`` is the complete PROCESSING dict (defaults + .cra).
     """
     import os
     from datetime import datetime
-    
     from ground_gnss_ro_pipeline import (
-        StationConfig, PipelineConfig, ProcessingResult, SP3Parser,
-        evaluate_ro_status, generate_raw_plots, generate_derived_plots,
-        generate_atmospheric_plots,
-        parse_gnss_directory, calculate_accurate_elevations,
-        calculate_geometric_doppler, apply_single_differencing,
-        retrieve_bending_angles, retrieve_refractivity,
-        compare_with_era5, retrieve_atmospheric_profile,
+        StationConfig, PipelineConfig, GNSSROPipeline,
+        generate_raw_plots, generate_derived_plots, generate_atmospheric_plots,
         apply_processing_config,
     )
 
-    # v3.4.4 — propagate the user's .cra PROCESSING overrides into THIS child
-    # process before any pipeline function runs. Constants like RO_MIN_EPOCHS,
-    # POLYNOMIAL_WINDOW, POLYFIT_GAP_THRESHOLD, etc. are module-level globals;
-    # this call mutates them so the downstream functions pick them up.
     if processing_cfg:
-        try:
-            apply_processing_config(processing_cfg)
-        except Exception:
-            pass
-    
+        apply_processing_config(processing_cfg)
+
     log_lines = []
-    
+    last = {'frac': 0.0}
+
     def log(message: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_lines.append(f"[{ts}] {message}")
-    
-    def progress(message: str, fraction: float):
+
+    def progress(message: str, fraction):
+        if fraction is not None:
+            last['frac'] = float(fraction)
         log(message)
-        progress_queue.put(('progress', 'ground', message, fraction))
-    
+        progress_queue.put(('progress', 'ground', message, last['frac'] * 0.9))
+
     def write_log():
-        log_path = os.path.join(output_dir, 'log.txt')
         try:
-            with open(log_path, 'w') as f:
+            with open(os.path.join(output_dir, 'log.txt'), 'w') as f:
                 f.write('\n'.join(log_lines))
-        except:
+        except OSError:
             pass
-    
+
     try:
+        os.makedirs(output_dir, exist_ok=True)
         station = StationConfig(**station_dict)
-        config = PipelineConfig()
-        results = {}
-        
         log("=" * 60)
         log("GROUND-BASED GNSS-RO Pipeline")
         log("=" * 60)
-        log(f"Station: {station.name}")
-        log(f"Location: {station.latitude:.4f}°N, {station.longitude:.4f}°E, {station.altitude:.1f}m")
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Step 1: Parse UBX
-        progress("Parsing Observation files...", 0.02)
-        obs_csv = f"{output_dir}/step1_observations.csv"
-        results['step1'] = parse_gnss_directory(ubx_dir, obs_csv)
-        if not results['step1'].success:
-            progress_queue.put(('done', 'ground', False, "Opservation file parsing failed", None))
+        log(f"Station (GUI): {station.name} {station.latitude:.6f}N {station.longitude:.6f}E GPS height {station.altitude:.1f} m")
+        if processing_cfg:
+            log("PROCESSING: " + ", ".join(f"{k}={v}" for k, v in sorted(processing_cfg.items())))
+
+        pipe = GNSSROPipeline(station, PipelineConfig())
+        results = pipe.run_full_pipeline(ubx_dir, sp3_file, era5_file, output_dir, progress)
+        station = pipe.station                        # the station actually used
+        for k, r in results.items():
+            log(f"{'OK ' if r.success else 'ERR'} {k}: {r.message}")
+        s5 = results.get('step5')
+        if s5 is not None:
+            for sid, why in (s5.metadata or {}).get('skipped', {}).items():
+                log(f"    no profile {sid}: {why}")
+
+        if not results.get('step1') or not results['step1'].success:
             write_log()
+            progress_queue.put(('done', 'ground', False, "Observation file parsing failed", None))
             return
-        
-        # Step 2: SP3 Matching
-        progress("Matching with SP3 ephemeris...", 0.10)
-        matched_csv = f"{output_dir}/step2_matched.csv"
-        
-        df = pd.read_csv(obs_csv)
-        df['parsed_utc'] = pd.to_datetime(df['utc'], format='mixed', errors='coerce')
-        df['parsed_utc'] = df['parsed_utc'].dt.tz_localize(None)
-        df = df.dropna(subset=['parsed_utc'])
-        df['sat_identifier'] = df['gnssId'].astype(str) + ' ' + df['svId'].astype(str)
-        
-        sp3 = SP3Parser(sp3_file)
-        
-        sp3_cols = ['gps_time_used', 'interp_x', 'interp_y', 'interp_z',
-                    'interp_vel_x', 'interp_vel_y', 'interp_vel_z',
-                    'interp_speed', 'interp_clk', 'sp3_match_status']
-        for col in sp3_cols:
-            df[col] = np.nan
-        df['sp3_match_status'] = 'no_match'
-        
-        matched_count = 0
-        total_count = len(df)
-        batch_size = 2000
-        
-        for i, (idx, row) in enumerate(df.iterrows()):
-            sp3_data = sp3.interpolate(row['sat_identifier'], row['parsed_utc'])
-            if sp3_data:
-                for key, value in sp3_data.items():
-                    if key in df.columns:
-                        df.at[idx, key] = value
-                df.at[idx, 'sp3_match_status'] = 'matched'
-                matched_count += 1
-            
-            if (i + 1) % batch_size == 0:
-                frac = 0.10 + 0.25 * ((i + 1) / total_count)
-                progress(f"SP3 matching: {i + 1:,}/{total_count:,}", frac)
-        
-        progress(f"SP3 matching complete: {matched_count:,}/{total_count:,}", 0.35)
-        
-        df_matched = df[df['sp3_match_status'] == 'matched'].copy()
-        if not df_matched.empty:
-            df_matched.to_csv(matched_csv, index=False)
-        
-        results['step2'] = ProcessingResult(
-            success=True, data=df_matched,
-            message=f"Matched {matched_count}/{total_count}",
-            metadata={'total': total_count, 'matched': matched_count}
-        )
-        
-        # Step 3a: Elevations
-        progress("Calculating satellite elevations...", 0.38)
-        elev_csv = f"{output_dir}/step3a_elevations.csv"
-        results['step3a'] = calculate_accurate_elevations(matched_csv, station, elev_csv)
-        
-        # Step 3b: Geometric Doppler
-        progress("Computing geometric Doppler...", 0.42)
-        doppler_csv = f"{output_dir}/step3b_doppler.csv"
-        results['step3b'] = calculate_geometric_doppler(elev_csv, station, doppler_csv)
-        
-        # Step 4: Single Differencing
-        progress("Applying single differencing...", 0.48)
-        diff_csv = f"{output_dir}/step4_differenced.csv"
-        results['step4'] = apply_single_differencing(doppler_csv, config, diff_csv)
-        
-        intermediate_data = None
-        if os.path.exists(diff_csv):
-            intermediate_data = pd.read_csv(diff_csv)
-        
-        # Step 5: Bending Angles
-        progress("Retrieving bending angles...", 0.52)
-        bending_dir = f"{output_dir}/bending"
-        results['step5'] = retrieve_bending_angles(
-            diff_csv, station, config, bending_dir,
-            lambda msg, frac: progress(msg, frac)
-        )
-        
-        # Steps 6 & 7: Per-satellite processing
-        if results['step5'].success and results['step5'].data is not None:
-            summary = results['step5'].data
-            total_sats = len(summary)
-            
-            for idx, row in summary.iterrows():
-                sat_id = row['sat_id']
-                bending_csv = f"{bending_dir}/{sat_id}_bending.csv"
-                
-                frac = 0.80 + 0.10 * ((idx + 1) / max(total_sats, 1))
-                progress(f"Abel inversion: {sat_id} ({idx+1}/{total_sats})", frac)
-                
-                if os.path.exists(bending_csv):
-                    refrac_csv = f"{output_dir}/refractivity/{sat_id}_refractivity.csv"
-                    os.makedirs(os.path.dirname(refrac_csv), exist_ok=True)
-                    result = retrieve_refractivity(bending_csv, refrac_csv)
-                    results[f'step6_{sat_id}'] = result
-                    
-                    if era5_file and result.success:
-                        comp_csv = f"{output_dir}/comparison/{sat_id}_comparison.csv"
-                        atm_csv = f"{output_dir}/atmospheric/{sat_id}_atmospheric.csv"
-                        os.makedirs(os.path.dirname(comp_csv), exist_ok=True)
-                        os.makedirs(os.path.dirname(atm_csv), exist_ok=True)
-                        
-                        results[f'step6b_{sat_id}'] = compare_with_era5(
-                            refrac_csv, era5_file, station.latitude, station.longitude, comp_csv
-                        )
-                        results[f'step7_{sat_id}'] = retrieve_atmospheric_profile(
-                            refrac_csv, era5_file, station.latitude, station.longitude, atm_csv
-                        )
-        
-        # Generate plots
-        progress("Generating plots...", 0.92)
-        
-        if intermediate_data is not None:
-            plots_dir = os.path.join(output_dir, 'plots')
-            os.makedirs(plots_dir, exist_ok=True)
-            
-            df_plot = intermediate_data.copy()
-            if 'sat_id' not in df_plot.columns:
-                if 'gnssId' in df_plot.columns and 'svId' in df_plot.columns:
-                    df_plot['sat_id'] = df_plot['gnssId'].astype(str) + '_' + df_plot['svId'].astype(str)
-            
-            ro_status = evaluate_ro_status(df_plot)
-            satellites = list(df_plot['sat_id'].unique())
-            
-            for sat_id in satellites:
-                sat_data = df_plot[df_plot['sat_id'] == sat_id]
-                
-                raw_path = os.path.join(plots_dir, f'{sat_id}_raw.png')
-                generate_raw_plots(sat_data, sat_id, raw_path)
-                
-                if ro_status.get(sat_id, False):
-                    sat_results = {
-                        'bending_csv': os.path.join(output_dir, 'bending', f'{sat_id}_bending.csv'),
-                        'refrac_csv': os.path.join(output_dir, 'refractivity', f'{sat_id}_refractivity.csv'),
-                        'comp_csv': os.path.join(output_dir, 'comparison', f'{sat_id}_comparison.csv'),
-                        'atm_csv': os.path.join(output_dir, 'atmospheric', f'{sat_id}_atmospheric.csv'),
-                    }
-                    derived_path = os.path.join(plots_dir, f'{sat_id}_derived.png')
-                    generate_derived_plots(sat_results, sat_id, derived_path,
-                                           station_altitude=station.altitude)
-                    
-                    atm_path = os.path.join(plots_dir, f'{sat_id}_atmospheric.png')
-                    generate_atmospheric_plots(sat_results, sat_id, atm_path)
-        
-        write_log()
+        diff_csv = os.path.join(output_dir, 'step4_differenced.csv')
+        if not os.path.exists(diff_csv):
+            write_log()
+            msg = next((r.message for r in results.values() if not r.success), "pipeline stopped before step 4")
+            progress_queue.put(('done', 'ground', False, msg, None))
+            return
 
-        success_count = sum(1 for r in results.values() if r.success)
+        # ---- plots: raw per satellite, derived/atmospheric per occultation event
+        progress("Generating plots...", 0.95)
+        plots_dir = os.path.join(output_dir, 'plots')
+        os.makedirs(plots_dir, exist_ok=True)
+        df_plot = pd.read_csv(diff_csv)
+        if 'sat_id' not in df_plot.columns:
+            df_plot['sat_id'] = df_plot['gnssId'].astype(str) + '_' + df_plot['svId'].astype(str)
+        from ground_gnss_ro_pipeline import session_sample_rate
+        site = {'name': station_dict.get('name') or '', 'lat': station.latitude, 'lon': station.longitude,
+                'height_ell_m': station.altitude,
+                'height_msl_m': station.altitude - getattr(station, 'geoid_sep_m', 0.0),
+                'rate': session_sample_rate(df_plot['timestamp'])}
+        if 'obs_interval_s' in df_plot.columns:                  # 3.5.2: recorded rate (RINEX thinned to 1 Hz)
+            _iv = pd.to_numeric(df_plot['obs_interval_s'], errors='coerce').median()
+            site['rate']['recorded_hz'] = float(1.0 / _iv) if np.isfinite(_iv) and _iv > 0 else np.nan
+        log(f"Session sample rate {site['rate']['rate_hz']:.3f} Hz processed"
+            + (f" ({site['rate']['recorded_hz']:.0f} Hz recorded)" if np.isfinite(site['rate'].get('recorded_hz', np.nan)) else '')
+            + f", {site['rate']['n_gaps']} gap(s) excluded")
+        for sat_id, sat_data in df_plot.groupby('sat_id'):
+            site_sat = dict(site)
+            if {'sta_lat', 'sta_lon', 'sta_h'} <= set(sat_data.columns):      # this satellite's own file fix
+                med = lambda c: float(pd.to_numeric(sat_data[c], errors='coerce').median())
+                geo = med('sta_geoid') if 'sta_geoid' in sat_data.columns else 0.0
+                geo = 0.0 if not np.isfinite(geo) else geo
+                site_sat.update({'lat': med('sta_lat'), 'lon': med('sta_lon'), 'height_msl_m': med('sta_h') - geo})
+            generate_raw_plots(sat_data, sat_id, os.path.join(plots_dir, f'{sat_id}_raw.png'), site=site_sat)
+        summary = s5.data if (s5 is not None and s5.data is not None) else pd.DataFrame()
+        for _, row in summary.iterrows():
+            ev = row['sat_id']
+            sat_results = {
+                'bending_csv': os.path.join(output_dir, 'bending', f'{ev}_bending.csv'),
+                'refrac_csv': os.path.join(output_dir, 'refractivity', f'{ev}_refractivity.csv'),
+                'comp_csv': os.path.join(output_dir, 'comparison', f'{ev}_comparison.csv'),
+                'atm_csv': os.path.join(output_dir, 'atmospheric', f'{ev}_atmospheric.csv'),
+            }
+            generate_derived_plots(sat_results, ev, os.path.join(plots_dir, f'{ev}_derived.png'),
+                                   station_altitude=station.altitude, site=site)
+            generate_atmospheric_plots(sat_results, ev, os.path.join(plots_dir, f'{ev}_atmospheric.png'),
+                                       station_altitude=station.altitude)
 
-        # v3.4.4 — Remove redundant step1/2/3 CSVs after a successful run unless
-        # the user requested to keep them (KEEP_INTERMEDIATE_CSVS=true). All
-        # columns from those files are already present in step4_differenced.csv.
-        if (not keep_intermediate) and results.get('step4') and results['step4'].success:
+        # 3.5.2: data-collection quality of the session (GUI card + report)
+        try:
+            q = session_quality(df_plot)
+            with open(os.path.join(output_dir, 'session_quality.json'), 'w') as f:
+                json.dump(q, f, indent=1, default=lambda o: float(o) if hasattr(o, '__float__') else str(o))
+        except Exception as e:
+            log(f"session quality not written: {e}")
+
+        # v4.6: every item without a profile gets a Radio Occultation page listing the RO tests
+        from ground_gnss_ro_pipeline import generate_ro_checklist_plot, load_ro_checks
+        try:
+            status_, reasons_ = build_ground_status(output_dir, df_plot)
+        except Exception:
+            status_, reasons_ = {}, {}
+        bdir = os.path.join(output_dir, 'bending')
+        for item, state in status_.items():
+            if _norm_ground_state(state) in ('ro_empty', 'no_ro'):
+                generate_ro_checklist_plot(item, load_ro_checks(bdir, item),
+                                           os.path.join(plots_dir, f'{item}_derived.png'), reasons_.get(item, ''))
+
+        # 3.5.2: session report saved with the other outputs (session_report.pdf)
+        try:
+            from ground_gnss_ro_pipeline import generate_session_report
+            st_txt = (f"{station_dict.get('name') or 'Station'} "
+                      f"{station.latitude:.4f}°N {station.longitude:.4f}°E")
+            generate_session_report(output_dir, os.path.join(output_dir, 'session_report.pdf'), status_,
+                                    reasons_, st_txt, ground_hidden_items(output_dir, status_))
+            log("Session report: session_report.pdf")
+        except Exception as e:
+            log(f"session report not written: {e}")
+
+        if not keep_intermediate and results.get('step4') and results['step4'].success:
             removed = 0
             for name in ('step1_observations.csv', 'step2_matched.csv',
                          'step3a_elevations.csv', 'step3b_doppler.csv'):
-                p = os.path.join(output_dir, name)
-                if os.path.exists(p):
+                pth = os.path.join(output_dir, name)
+                if os.path.exists(pth):
                     try:
-                        os.remove(p)
+                        os.remove(pth)
                         removed += 1
                     except OSError:
                         pass
             if removed:
                 log(f"Cleanup: removed {removed} intermediate CSV file(s)")
-                write_log()
-
-        progress_queue.put(('done', 'ground', True, f"{success_count}/{len(results)} steps completed", diff_csv))
-        
+        write_log()
+        n_ok = sum(1 for r in results.values() if r.success)
+        st_msg = results['station'].message if 'station' in results else ''
+        progress_queue.put(('done', 'ground', True,
+                            f"{n_ok}/{len(results)} steps completed. {st_msg}", diff_csv))
     except Exception as e:
         import traceback
-        log(f"CRITICAL ERROR: {type(e).__name__}: {str(e)}")
+        log(f"CRITICAL ERROR: {type(e).__name__}: {e}")
         log(f"TRACEBACK:\n{traceback.format_exc()}")
         write_log()
         progress_queue.put(('done', 'ground', False, f"{type(e).__name__}: {e}", None))
@@ -1099,6 +1184,7 @@ class StationInfoPanel(QGroupBox):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Name:"))
         self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("from metadata.cra (optional)")
         self.name_edit.setPlaceholderText("Station identifier")
         row1.addWidget(self.name_edit)
         layout.addLayout(row1)
@@ -1107,12 +1193,12 @@ class StationInfoPanel(QGroupBox):
         row2.addWidget(QLabel("Lat:"))
         self.lat_edit = QLineEdit()
         self.lat_edit.setPlaceholderText("°N")
-        self.lat_edit.setMaximumWidth(80)
+        self.lat_edit.setMinimumWidth(110)
         row2.addWidget(self.lat_edit)
         row2.addWidget(QLabel("Lon:"))
         self.lon_edit = QLineEdit()
         self.lon_edit.setPlaceholderText("°E")
-        self.lon_edit.setMaximumWidth(80)
+        self.lon_edit.setMinimumWidth(110)
         row2.addWidget(self.lon_edit)
         row2.addStretch()
         layout.addLayout(row2)
@@ -1121,24 +1207,39 @@ class StationInfoPanel(QGroupBox):
         row3.addWidget(QLabel("Altitude:"))
         self.alt_edit = QLineEdit()
         self.alt_edit.setPlaceholderText("meters")
-        self.alt_edit.setMaximumWidth(100)
+        self.alt_edit.setMinimumWidth(90)
         row3.addWidget(self.alt_edit)
-        row3.addWidget(QLabel("m"))
+        row3.addWidget(QLabel("m (GPS height)"))
         row3.addStretch()
         layout.addLayout(row3)
     
+    def _fields(self):
+        return (self.name_edit, self.lat_edit, self.lon_edit, self.alt_edit)
+
+    def _set(self, edit: QLineEdit, text: str):
+        """v4.4: left-aligned and scrolled to the start (setText leaves the view at the end)."""
+        edit.setText(text)
+        edit.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        edit.setCursorPosition(0)
+
     def load_from_metadata(self, metadata: Dict):
-        self.name_edit.setText(str(metadata.get('STATION_NAME', '')))
-        self.lat_edit.setText(str(metadata.get('STATION_LAT', '')))
-        self.lon_edit.setText(str(metadata.get('STATION_LON', '')))
-        self.alt_edit.setText(str(metadata.get('STATION_HEIGHT', '')))
+        self._set(self.name_edit, str(metadata.get('STATION_NAME', '') or ''))
+        self._set(self.lat_edit, str(metadata.get('STATION_LAT', '')))
+        self._set(self.lon_edit, str(metadata.get('STATION_LON', '')))
+        self._set(self.alt_edit, str(metadata.get('STATION_HEIGHT', '')))
     
     def load_from_rinex_station(self, station_info: Dict):
-        """Load station position from RINEX header info dict."""
-        self.name_edit.setText(str(station_info.get('marker_name', 'RINEX Station')))
-        self.lat_edit.setText(f"{station_info['latitude']:.6f}")
-        self.lon_edit.setText(f"{station_info['longitude']:.6f}")
-        self.alt_edit.setText(f"{station_info['altitude']:.1f}")
+        """
+        Station from the receiver's 3D fix (UBX NAV-PVT / RINEX header). Height is
+        the GPS height (above sea level) people use; the geoid separation is kept
+        so the pipeline can convert. Name: .cra only, else empty.
+        """
+        self._set(self.name_edit, str(station_info.get('marker_name') or ''))
+        self._set(self.lat_edit, f"{station_info['latitude']:.6f}")
+        self._set(self.lon_edit, f"{station_info['longitude']:.6f}")
+        msl = station_info.get('altitude_msl')
+        self._set(self.alt_edit, f"{(msl if msl is not None else station_info['altitude']):.1f}")
+        self.geoid_sep_m = float(station_info.get('geoid_sep_m') or 0.0)
     
     def has_valid_coords(self) -> bool:
         """Check if station coordinates are filled in and valid."""
@@ -1155,8 +1256,10 @@ class StationInfoPanel(QGroupBox):
             return StationConfig(
                 latitude=float(self.lat_edit.text()),
                 longitude=float(self.lon_edit.text()),
-                altitude=float(self.alt_edit.text()),
-                name=self.name_edit.text() or "Station"
+                altitude=float(self.alt_edit.text()),          # GPS height (above sea level)
+                name=self.name_edit.text(),
+                height_ref='msl',
+                geoid_sep_m=getattr(self, 'geoid_sep_m', 0.0),
             )
         except ValueError:
             return None
@@ -1168,6 +1271,7 @@ class StationInfoPanel(QGroupBox):
                 'STATION_LAT': float(self.lat_edit.text()),
                 'STATION_LON': float(self.lon_edit.text()),
                 'STATION_HEIGHT': float(self.alt_edit.text()),
+                'STATION_HEIGHT_REF': 'GPS height above sea level (m)',
             }
         except ValueError:
             return {}
@@ -1188,19 +1292,26 @@ class ProcessingPanel(QGroupBox):
     """
 
     # Field spec: (key, label, kind, min, max, decimals, tooltip)
+    # v4.3: keys are the pipeline's own PROCESSING names (older versions used
+    # *_S / *_DEG / *_HZ names the pipeline never read).
     _SPEC = [
-        ('POLY_SMOOTH_WINDOW_S',           'Poly smooth window (s)',    'float', 0.0,   10000.0, 1,    "Polynomial smoothing window (s). 50 Hz data → ~150."),
-        ('POLYFIT_GAP_THRESHOLD_S',        'Polyfit gap threshold (s)', 'float', 0.1,   600.0,   1,    "Restart polyfit when time gap ≥ this many seconds."),
-        ('RO_ELEVATION_THRESHOLD_DEG',     'RO elevation thresh (°)',   'float', -10.0, 90.0,    2,    "Elevation below which RO geometry is sought."),
-        ('RO_DOPPLER_THRESHOLD_HZ',        'RO Doppler thresh (Hz)',    'float', 0.0,   100.0,   2,    "Minimum |atmos_doppler| to flag an RO event."),
-        ('RO_MIN_EPOCHS',                  'RO min epochs',             'int',   1,     100000,  1,    "Minimum RO epochs for a valid event."),
-        ('REF_SAT_ELEVATION_THRESHOLD_DEG','Ref-sat elev thresh (°)',   'float', 0.0,   90.0,    1,    "Minimum elevation for reference satellite candidates."),
-        ('REF_SAT_MIN_EPOCHS',             'Ref-sat min epochs',        'int',   1,     100000,  1,    "Minimum coverage for a reference satellite."),
-        ('REF_SAT_JUMP_THRESHOLD_HZ',      'Ref-sat jump thresh (Hz)', 'float', 0.0,   100.0,   2,    "Epoch-to-epoch excess Doppler jump (cycle-slip detection)."),
-        ('N_COEFF_A1',                     'Smith–Weintraub a1',        'float', 0.0,   1e6,     3,    "Refractivity dry term coefficient (unitless)."),
-        ('N_COEFF_A2',                     'Smith–Weintraub a2',        'float', 0.0,   1e9,     2,    "Refractivity wet term coefficient (unitless)."),
-        ('KEEP_INTERMEDIATE_CSVS',         'Keep step1–3 CSVs',         'bool',  None,  None,    None, "Keep intermediate step1/2/3 CSVs after a successful run."),
-        ('FORCE_CRA_STATION_COORDS',       'Force .cra station coords', 'bool',  None,  None,    None, "Station coords from .cra override the RINEX header."),
+        ('POLY_SMOOTH_WINDOW',          'Max smooth window (s)',     'float', 1.0,   10000.0, 1,    "Upper limit of the Fresnel-adaptive Doppler smoothing window (s)."),
+        ('POLY_MIN_WINDOW',             'Min smooth window (s)',     'float', 1.0,   1000.0,  1,    "Lower limit of the smoothing window (s)."),
+        ('POLYFIT_GAP_THRESHOLD',       'Polyfit gap threshold (s)', 'float', 0.1,   600.0,   1,    "Restart the smoothing fit when the time gap is at least this long (s)."),
+        ('SMOOTH_ELEV_MAX_DEG',         'Smooth below elev (°)',     'float', 0.0,   90.0,    1,    "Smooth the atmospheric Doppler only below this elevation. 90 = all (fit line on every raw plot)."),
+        ('RO_ELEVATION_THRESHOLD',      'RO elevation thresh (°)',   'float', -10.0, 90.0,    2,    "Only rays below this elevation are used (both sides of the horizon)."),
+        ('RO_DOPPLER_THRESHOLD',        'RO Doppler thresh (Hz)',    'float', 0.0,   100.0,   2,    "Minimum |atmospheric Doppler| for RO epochs. 0 = off (real values are only 0.2–3 Hz)."),
+        ('RO_MIN_EPOCHS',               'RO min epochs',             'int',   1,     100000,  1,    "Minimum low-elevation epochs for an RO candidate."),
+        ('RO_MIN_NEG_ELEV_EPOCHS',      'RO min epochs below 0°',    'int',   0,     100000,  1,    "Minimum epochs at negative geometric elevation."),
+        ('EVENT_GAP_S',                 'Event gap (s)',             'float', 1.0,   86400.0, 1,    "A gap longer than this splits a satellite into separate occultation events."),
+        ('ALLOW_SINGLE_FREQ',           'Allow single-frequency',    'bool',  None,  None,    None, "Use L1-only events when dual-frequency data is missing.\nNO ionospheric correction (~1–2% in N). Results are flagged ◐ [RO·1F] in amber."),
+        ('REF_SAT_ELEVATION_THRESHOLD', 'Ref-sat elev thresh (°)',   'float', 0.0,   90.0,    1,    "Reference satellites must stay above this elevation; epochs without one are dropped."),
+        ('REF_SAT_MIN_EPOCHS',          'Ref-sat min epochs',        'int',   1,     100000,  1,    "Minimum coverage for the primary reference satellite."),
+        ('REF_SAT_JUMP_THRESHOLD',      'Ref-sat jump thresh (Hz)',  'float', 0.0,   100.0,   2,    "Excess-Doppler jump counted as a cycle slip when scoring references."),
+        ('N_COEFF_A1',                  'Smith–Weintraub a1',        'float', 0.0,   1e6,     3,    "Refractivity dry term coefficient (K/hPa)."),
+        ('N_COEFF_A2',                  'Smith–Weintraub a2',        'float', 0.0,   1e9,     2,    "Refractivity wet term coefficient (K²/hPa)."),
+        ('KEEP_INTERMEDIATE_CSVS',      'Keep step1–3 CSVs',         'bool',  None,  None,    None, "Keep intermediate step1/2/3 CSVs after a successful run."),
+        ('FORCE_CRA_STATION_COORDS',    'Force .cra station coords', 'bool',  None,  None,    None, "Use the station coordinates typed here / in .cra instead of the receiver's own position\n(UBX 3D fix or RINEX header). Leave off unless the receiver position is known to be wrong."),
     ]
 
     def __init__(self, parent=None):
@@ -1218,6 +1329,8 @@ class ProcessingPanel(QGroupBox):
         self.setCheckable(True)
         self.setChecked(False)           # collapsed by default
         self._widgets: Dict[str, QWidget] = {}
+        self._labels: Dict[str, QLabel] = {}
+        self._defaults = load_processing_config_from_cra({})
 
         # Build form inside a plain widget -----------------------------------
         form_widget = QWidget()
@@ -1238,13 +1351,25 @@ class ProcessingPanel(QGroupBox):
                 w = QSpinBox()
                 w.setRange(int(mn), int(mx))
                 w.setMinimumWidth(90)
-            elif kind == 'bool':
+            elif kind in ('bool', 'apmodel'):
                 w = QCheckBox()
             else:
                 continue
             w.setToolTip(tip)
             self._widgets[key] = w
-            form.addRow(label, w)
+            lbl = QLabel(label)
+            self._labels[key] = lbl
+            form.addRow(lbl, w)
+            # 3.5.2 — highlight values that differ from the defaults
+            if isinstance(w, QCheckBox):
+                w.toggled.connect(lambda _=None: self._mark_changed())
+            else:
+                w.valueChanged.connect(lambda _=None: self._mark_changed())
+
+        self.reset_btn = QPushButton("Reset to defaults")
+        self.reset_btn.setToolTip("Set every value back to the pipeline default (saved to .cra on the next run).")
+        self.reset_btn.clicked.connect(lambda: self.load_from_cra({}))
+        form.addRow(self.reset_btn)
 
         # Scroll area — caps height to 55% of screen so the panel never
         # pushes below the visible area on 720p / HD displays.
@@ -1287,7 +1412,11 @@ class ProcessingPanel(QGroupBox):
                 continue
             val = cfg[key]
             try:
-                if isinstance(w, QCheckBox):
+                if key == 'ALPHA_P_MODEL':
+                    v = str(val).lower()
+                    self._ap_always = v == 'always'
+                    w.setChecked(v in ('fill', 'always', 'true', '1'))
+                elif isinstance(w, QCheckBox):
                     w.setChecked(bool(val))
                 elif isinstance(w, QSpinBox):
                     w.setValue(int(val))
@@ -1295,12 +1424,31 @@ class ProcessingPanel(QGroupBox):
                     w.setValue(float(val))
             except (TypeError, ValueError):
                 pass
+        self._mark_changed()
+
+    def _mark_changed(self):
+        """3.5.2 — amber, bold label where the value differs from the default."""
+        cur = self.to_processing_dict()
+        n = 0
+        for key, lbl in self._labels.items():
+            d, v = self._defaults.get(key), cur.get(key)
+            try:
+                changed = (abs(float(v) - float(d)) > 1e-9 * max(1.0, abs(float(d))))
+            except (TypeError, ValueError):
+                changed = v != d
+            n += bool(changed)
+            lbl.setStyleSheet("QLabel { color: #B35C00; font-weight: 600; }" if changed else "")
+            lbl.setToolTip(f"Default: {d}")
+        self.setTitle("Advanced Settings" + (f"  ({n} changed)" if n else ""))
 
     def to_processing_dict(self) -> Dict[str, Any]:
         """Read widget values back into a PROCESSING dict."""
         out: Dict[str, Any] = {}
         for key, w in self._widgets.items():
-            if isinstance(w, QCheckBox):
+            if key == 'ALPHA_P_MODEL':
+                out[key] = (('always' if getattr(self, '_ap_always', False) else 'fill')
+                            if w.isChecked() else 'off')
+            elif isinstance(w, QCheckBox):
                 out[key] = w.isChecked()
             elif isinstance(w, QSpinBox):
                 out[key] = int(w.value())
@@ -1321,8 +1469,60 @@ class ProcessingPanel(QGroupBox):
 # RESULT LIST WIDGET
 # ============================================================================
 
+GROUND_LEGEND = "● RO profile    ◐ RO profile, single-freq (no iono corr.)    ○ no profile / no RO"
+
+
+GROUND_ROW_STYLE = {
+    # state: (marker, suffix, color, derived tabs enabled)
+    'ro_ok':    ('●', '  [RO]',    '#2E7D32', True),
+    'ro_ok_1f': ('◐', '  [RO·1F]', '#E65100', True),    # single frequency: no iono correction
+    'ro_empty': ('○', '',          '#A1887F', False),
+    'no_ro':    ('○', '',          '#757575', False),
+}
+
+
+def _norm_ground_state(v) -> str:
+    if v == 'ro_ok' or v is True:
+        return 'ro_ok'
+    if v in ('ro_ok_1f', 'ro_empty'):
+        return v
+    return 'no_ro'
+
+
 class ResultListWidget(QListWidget):
     """Unified list for both ground satellites and satellite events."""
+
+    def _add_ground_rows(self, ro_status: Dict[str, Any], indent: str = "", hidden: Optional[set] = None):
+        """v4.3: rows with a profile (dual first, then single-frequency), separator, the rest.
+        3.5.2: items in ``hidden`` (never below the RO elevation threshold) are left out."""
+        hidden = hidden or set()
+        groups = {k: sorted(s for s, v in ro_status.items() if _norm_ground_state(v) == k and s not in hidden)
+                  for k in GROUND_ROW_STYLE}
+        with_profile = groups['ro_ok'] + groups['ro_ok_1f']
+        without = groups['ro_empty'] + groups['no_ro']
+        for state in ('ro_ok', 'ro_ok_1f'):
+            for sat_id in groups[state]:
+                self._ground_item(sat_id, state, indent)
+        if with_profile and without:
+            sep = QListWidgetItem("─" * 24)
+            sep.setFlags(Qt.ItemFlag.NoItemFlags)
+            sep.setForeground(QColor('#BDBDBD'))
+            self.addItem(sep)
+        for state in ('ro_empty', 'no_ro'):
+            for sat_id in groups[state]:
+                self._ground_item(sat_id, state, indent)
+
+    def _ground_item(self, sat_id: str, state: str, indent: str = ""):
+        marker, suffix, color, enabled = GROUND_ROW_STYLE[state]
+        item = QListWidgetItem(f"{indent}{marker} {sat_id}{suffix}")
+        item.setForeground(QColor(color))
+        if state == 'ro_ok_1f':
+            item.setToolTip("Single-frequency occultation: no ionospheric correction (~1–2% in N).")
+        item.setData(Qt.ItemDataRole.UserRole, sat_id)
+        item.setData(Qt.ItemDataRole.UserRole + 1, enabled)
+        item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
+        item.setData(Qt.ItemDataRole.UserRole + 3, state)
+        self.addItem(item)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1342,7 +1542,7 @@ class ResultListWidget(QListWidget):
         """)
         self.current_mode = None  # 'ground' or 'satellite'
     
-    def populate_ground(self, ro_status: Dict[str, Any]):
+    def populate_ground(self, ro_status: Dict[str, Any], hidden: Optional[set] = None):
         """Populate with ground-based satellite results.
 
         v3.4.4.1: ``ro_status`` values are tri-state:
@@ -1358,57 +1558,8 @@ class ResultListWidget(QListWidget):
         """
         self.clear()
         self.current_mode = 'ground'
+        self._add_ground_rows(ro_status, hidden=hidden)
 
-        # Normalise to tri-state; treat legacy True/False inputs gracefully.
-        def _state(v):
-            if v == 'ro_ok' or v is True:
-                return 'ro_ok'
-            if v == 'ro_empty':
-                return 'ro_empty'
-            return False
-
-        green = sorted([s for s, v in ro_status.items() if _state(v) == 'ro_ok'])
-        yellow = sorted([s for s, v in ro_status.items() if _state(v) == 'ro_empty'])
-        gray = sorted([s for s, v in ro_status.items() if _state(v) is False])
-
-        for sat_id in green:
-            item = QListWidgetItem(f"● {sat_id}  [RO]")
-            item.setForeground(QColor('#2E7D32'))
-            item.setData(Qt.ItemDataRole.UserRole, sat_id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, True)   # derived tabs enabled
-            item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
-            item.setData(Qt.ItemDataRole.UserRole + 3, 'ro_ok')
-            self.addItem(item)
-
-        # Separator between the rows that have derived data and the ones
-        # that don't (both yellow and gray fall in the latter group).
-        if green and (yellow or gray):
-            sep = QListWidgetItem("─" * 24)
-            sep.setFlags(Qt.ItemFlag.NoItemFlags)
-            sep.setForeground(QColor('#BDBDBD'))
-            self.addItem(sep)
-
-        # Yellow rows: same marker as gray, no '[RO • no profile]' suffix —
-        # the faded color is the only visual cue, keeping the row layout
-        # uniform with the non-RO rows below.
-        for sat_id in yellow:
-            item = QListWidgetItem(f"○ {sat_id}")
-            item.setForeground(QColor('#A1887F'))  # faded warm-gray (between gray and amber)
-            item.setData(Qt.ItemDataRole.UserRole, sat_id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, False)  # derived tabs blocked
-            item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
-            item.setData(Qt.ItemDataRole.UserRole + 3, 'ro_empty')
-            self.addItem(item)
-
-        for sat_id in gray:
-            item = QListWidgetItem(f"○ {sat_id}")
-            item.setForeground(QColor('#757575'))
-            item.setData(Qt.ItemDataRole.UserRole, sat_id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, False)
-            item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
-            item.setData(Qt.ItemDataRole.UserRole + 3, 'no_ro')
-            self.addItem(item)
-    
     def populate_satellite(self, summary_df: pd.DataFrame):
         """Populate with satellite event results."""
         self.clear()
@@ -1446,7 +1597,8 @@ class ResultListWidget(QListWidget):
             item.setData(Qt.ItemDataRole.UserRole + 2, 'satellite')
             self.addItem(item)
     
-    def populate_both(self, ground_ro_status: Dict[str, Any], sat_summary_df: pd.DataFrame):
+    def populate_both(self, ground_ro_status: Dict[str, Any], sat_summary_df: pd.DataFrame,
+                      hidden: Optional[set] = None):
         """Populate with both ground and satellite results."""
         self.clear()
         self.current_mode = 'both'
@@ -1460,44 +1612,7 @@ class ResultListWidget(QListWidget):
         header_g.setFont(font)
         self.addItem(header_g)
 
-        def _state(v):
-            if v == 'ro_ok' or v is True:
-                return 'ro_ok'
-            if v == 'ro_empty':
-                return 'ro_empty'
-            return False
-
-        green = sorted([s for s, v in ground_ro_status.items() if _state(v) == 'ro_ok'])
-        yellow = sorted([s for s, v in ground_ro_status.items() if _state(v) == 'ro_empty'])
-        gray = sorted([s for s, v in ground_ro_status.items() if _state(v) is False])
-
-        for sat_id in green:
-            item = QListWidgetItem(f"  ● {sat_id}  [RO]")
-            item.setForeground(QColor('#2E7D32'))
-            item.setData(Qt.ItemDataRole.UserRole, sat_id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, True)
-            item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
-            item.setData(Qt.ItemDataRole.UserRole + 3, 'ro_ok')
-            self.addItem(item)
-
-        # v3.4.4.2 — yellow alongside gray, no suffix, faded color.
-        for sat_id in yellow:
-            item = QListWidgetItem(f"  ○ {sat_id}")
-            item.setForeground(QColor('#A1887F'))
-            item.setData(Qt.ItemDataRole.UserRole, sat_id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, False)
-            item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
-            item.setData(Qt.ItemDataRole.UserRole + 3, 'ro_empty')
-            self.addItem(item)
-
-        for sat_id in gray:
-            item = QListWidgetItem(f"  ○ {sat_id}")
-            item.setForeground(QColor('#757575'))
-            item.setData(Qt.ItemDataRole.UserRole, sat_id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, False)
-            item.setData(Qt.ItemDataRole.UserRole + 2, 'ground')
-            item.setData(Qt.ItemDataRole.UserRole + 3, 'no_ro')
-            self.addItem(item)
+        self._add_ground_rows(ground_ro_status, indent="  ", hidden=hidden)
         
         # Satellite section header
         header_s = QListWidgetItem("═══ SATELLITE ═══")
@@ -1610,7 +1725,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GNSS Radio Occultation Processor v3.4.7")
+        self.setWindowTitle(f"GNSS Radio Occultation Processor {__version__}")
 
         # v3.4.7 — a 1200x800 minimum does not fit a 1366x768 laptop: the
         # window was forced taller than the desktop and the bottom of the
@@ -1635,6 +1750,8 @@ class MainWindow(QMainWindow):
         # Ground results
         self.ground_intermediate_data = None
         self.ground_ro_status = {}
+        self.ground_reasons = {}
+        self.ground_message = ''
         self.ground_output_dir = None
         
         # Satellite results
@@ -1719,6 +1836,14 @@ class MainWindow(QMainWindow):
         self.browse_btn.setStyleSheet(
             f"QPushButton {{ font-size: {FS_BROWSE}px; padding: 4px 8px; }}")
         dir_layout.addWidget(self.browse_btn)
+
+        # 3.5.2 — recent folders
+        self.recent_btn = QPushButton("Recent")
+        self.recent_btn.setMaximumWidth(72)
+        self.recent_btn.setStyleSheet(
+            f"QPushButton {{ font-size: {FS_BROWSE}px; padding: 4px 6px; }}")
+        self.recent_btn.setVisible(QMenu is not None)
+        dir_layout.addWidget(self.recent_btn)
         input_layout.addLayout(dir_layout)
 
         self.validation_label = WrapLabel("")
@@ -1787,7 +1912,17 @@ class MainWindow(QMainWindow):
         # Result list
         result_group = QGroupBox("Results")
         result_layout = QVBoxLayout(result_group)
-        
+
+        # 3.5.2 — one-line summary + 'show all' toggle above the list
+        self.summary_label = WrapLabel("")
+        self.summary_label.setStyleSheet(f"QLabel {{ color: #424242; font-size: {FS_RESULT_NOTE}px; }}")
+        result_layout.addWidget(self.summary_label)
+        self.show_all_cb = QCheckBox("Show all satellites")
+        self.show_all_cb.setToolTip("Also list satellites that never went below the RO elevation threshold.")
+        self.show_all_cb.setStyleSheet(f"QCheckBox {{ font-size: {FS_RESULT_NOTE}px; }}")
+        self.show_all_cb.setVisible(False)
+        result_layout.addWidget(self.show_all_cb)
+
         self.result_list = ResultListWidget()
         result_layout.addWidget(self.result_list)
         
@@ -1796,7 +1931,15 @@ class MainWindow(QMainWindow):
         self.legend_label.setStyleSheet(
             f"QLabel {{ color: #757575; font-size: {FS_RESULT_NOTE}px; }}")
         result_layout.addWidget(self.legend_label)
-        
+
+        # 3.5.2 — session quality card + session report
+        self.quality_label = WrapLabel("")
+        self.quality_label.setStyleSheet(
+            f"QLabel {{ color: #424242; font-size: {FS_RESULT_NOTE}px; background: #F5F5F2;"
+            f" border: 1px solid #E0E0DC; border-radius: 4px; padding: 4px 6px; }}")
+        self.quality_label.setVisible(False)
+        result_layout.addWidget(self.quality_label)
+
         sidebar_layout.addWidget(result_group, 1)
         
         splitter.addWidget(sidebar)
@@ -1821,11 +1964,11 @@ class MainWindow(QMainWindow):
         
         self.raw_canvas = InteractivePlotWidget()
         self.raw_canvas.show_placeholder("Select an item to view observations")
-        self.tab_widget.addTab(self.raw_canvas, "Observations / Raw")
+        self.tab_widget.addTab(self.raw_canvas, "GNSS Raw Observations")
         
         self.derived_canvas = InteractivePlotWidget()
         self.derived_canvas.show_placeholder("Select a successful item to view profiles")
-        self.tab_widget.addTab(self.derived_canvas, "Bending / Refractivity")
+        self.tab_widget.addTab(self.derived_canvas, "Radio Occultation")
         
         self.atm_canvas = InteractivePlotWidget()
         self.atm_canvas.show_placeholder("Select a successful item to view atmospheric profiles")
@@ -1838,6 +1981,8 @@ class MainWindow(QMainWindow):
     
     def _connect_signals(self):
         self.browse_btn.clicked.connect(self._browse_directory)
+        self.recent_btn.clicked.connect(self._show_recent_menu)
+        self.show_all_cb.toggled.connect(lambda _=None: self._populate_results())
         self.run_btn.clicked.connect(self._on_run_clicked)
         self.stop_btn.clicked.connect(self._stop_pipeline)
         # v3.4.4.2 — react to BOTH mouse clicks AND keyboard navigation.
@@ -1855,12 +2000,28 @@ class MainWindow(QMainWindow):
             self._run_pipeline()
     
     def _browse_directory(self):
+        last = _load_prefs().get('last_dir', '')
+        start = os.path.dirname(last) if last and os.path.isdir(os.path.dirname(last)) else ""
         directory = QFileDialog.getExistingDirectory(
-            self, "Select Data Directory", "",
+            self, "Select Data Directory", start,
             QFileDialog.Option.ShowDirsOnly
         )
         if directory:
             self._validate_directory(directory)
+
+    def _show_recent_menu(self):
+        """3.5.2 — recently opened data / result folders."""
+        if QMenu is None:
+            return
+        menu = QMenu(self)
+        rec = [d for d in _load_prefs().get('recent', []) if os.path.isdir(d)]
+        if not rec:
+            a = menu.addAction("(no recent folders)")
+            a.setEnabled(False)
+        for d in rec:
+            a = menu.addAction(d)
+            a.triggered.connect(lambda _=False, d=d: self._validate_directory(d))
+        menu.exec(self.recent_btn.mapToGlobal(self.recent_btn.rect().bottomLeft()))
     
     def _validate_directory(self, directory: str):
         self.input_dir = directory
@@ -1877,28 +2038,26 @@ class MainWindow(QMainWindow):
         self._exit_load_mode()
         self.scan_result = scan_input_directory(directory)
 
+        _remember_dir(directory)
+        sr = self.scan_result
+        ok_ = lambda b: "✓" if b else "✗"
         msgs = []
-
-        # Data type indicator
-        if self.scan_result['data_type'] == DataType.GROUND:
-            msgs.append(f"<span style='color:#1976D2; font-weight:bold;'>"
-                        f"📡 {GROUND_DISPLAY_NAME}-based data</span>")
-        elif self.scan_result['data_type'] == DataType.SATELLITE:
-            msgs.append("<span style='color:#7B1FA2; font-weight:bold;'>🛰 Satellite (LEO) data</span>")
-        elif self.scan_result['data_type'] == DataType.BOTH:
-            msgs.append(f"<span style='color:#00796B; font-weight:bold;'>"
-                        f"📡🛰 {GROUND_DISPLAY_NAME} + Satellite data</span>")
-
-        # Info messages
-        for info in self.scan_result['info']:
-            msgs.append(f"<span style='color:#2E7D32'>✓ {info}</span>")
-
-        # Warnings
-        for w in self.scan_result['warnings']:
+        if sr['data_type'] in (DataType.GROUND, DataType.BOTH):
+            parts = [f"📡 {GROUND_DISPLAY_NAME}",
+                     f"{sr.get('n_obs', 0)} {sr.get('obs_source') or ''}",
+                     f"SP3 {ok_(sr['sp3_file'])}",
+                     f".nc {ok_(sr['era5_file'])}",
+                     ".cra ✓" if sr['metadata_file'] else ".cra: new"]
+            msgs.append("<span style='color:#1976D2; font-weight:bold;'>" + " · ".join(parts) + "</span>")
+        if sr['data_type'] in (DataType.SATELLITE, DataType.BOTH):
+            msgs.append("<span style='color:#7B1FA2; font-weight:bold;'>🛰 "
+                        f"{len(sr['conphs_files'])} conPhs · validation "
+                        f"{ok_(sr['has_atmprf'] or sr['has_wetpf2'])}</span>")
+        for w in sr['warnings']:
+            if w.startswith('No .nc') or w.startswith('No atmPrf'):
+                continue                                   # already shown as ✗ in the header line
             msgs.append(f"<span style='color:#F57C00'>⚠ {w}</span>")
-
-        # Errors
-        for e in self.scan_result['errors']:
+        for e in sr['errors']:
             msgs.append(f"<span style='color:#D32F2F'>✗ {e}</span>")
 
         self.validation_label.setText("<br>".join(msgs))
@@ -1912,6 +2071,10 @@ class MainWindow(QMainWindow):
         cra_data = None
         if has_ground and self.scan_result['metadata_file']:
             cra_data = load_metadata(self.scan_result['metadata_file'])
+            note_ = CRA_PARSE_NOTES.get(self.scan_result['metadata_file'])
+            if note_:
+                self.validation_label.setText(self.validation_label.text() +
+                                              f"<br><span style='color:#F57C00'>⚠ {note_}</span>")
             if cra_data:
                 self.station_panel.load_from_metadata(cra_data)
 
@@ -1919,49 +2082,64 @@ class MainWindow(QMainWindow):
         if has_ground:
             self.processing_panel.load_from_cra(cra_data or {})
 
-        # v3.4.4 — Resolve station coords:
-        #   - If user set FORCE_CRA_STATION_COORDS=true and .cra has coords, use those.
-        #   - Otherwise: if station panel is empty, try RINEX header (Feature 1).
+        # v4.3 — Resolve station coords:
+        #   - FORCE_CRA_STATION_COORDS on and .cra has coords -> use the .cra.
+        #   - Otherwise use the receiver's own position (UBX 3D fix or RINEX
+        #     header) — the same rule the pipeline applies — and warn if the
+        #     .cra disagrees. Without a .cra this fills the panel from the data.
         if has_ground:
-            force_cra = self.processing_panel.force_cra_coords()
-            cra_has_coords = bool(cra_data and all(
-                cra_data.get(k) not in (None, '') for k in
-                ('STATION_LAT', 'STATION_LON', 'STATION_HEIGHT')
-            ))
-
-            if force_cra and cra_has_coords:
-                # Already loaded from .cra above; just annotate.
-                self.validation_label.setText(
-                    self.validation_label.text() +
-                    "<br><span style='color:#1B5E20'>✓ Using station coords from .cra "
-                    "(FORCE_CRA_STATION_COORDS=true)</span>"
-                )
-            elif not self.station_panel.has_valid_coords():
-                self._try_load_rinex_station_position()
+            self._resolve_station_for_display(cra_data)
+            if self.processing_panel.to_processing_dict().get('ALLOW_SINGLE_FREQ'):
+                self._append_note("◐ Single-frequency allowed (flagged 1F)", '#E65100')
 
         self.run_btn.setEnabled(self.scan_result['valid'])
     
-    def _try_load_rinex_station_position(self):
-        """Try to read station position from RINEX file headers."""
+    def _append_note(self, text: str, color: str = '#1B5E20'):
+        self.validation_label.setText(self.validation_label.text() +
+                                      f"<br><span style='color:{color}'>{text}</span>")
+
+    def _resolve_station_for_display(self, cra_data: Optional[Dict]):
+        """Fill the station panel with the position the pipeline will actually use."""
+        force_cra = self.processing_panel.force_cra_coords()
+        cra_has_coords = bool(cra_data and all(
+            cra_data.get(k) not in (None, '') for k in ('STATION_LAT', 'STATION_LON', 'STATION_HEIGHT')))
+        if force_cra and cra_has_coords:
+            self._append_note("✓ Station from .cra (forced)")
+            return
+        info = None
         try:
-            from ground_gnss_ro_pipeline import extract_rinex_station_info
-            input_dir = self.scan_result.get('ubx_dir')
-            if not input_dir:
-                return
-            station_info = extract_rinex_station_info(input_dir)
-            if station_info:
-                self.station_panel.load_from_rinex_station(station_info)
-                self.validation_label.setText(
-                    self.validation_label.text() + 
-                    f"<br><span style='color:#1B5E20'>✓ Station position auto-read from RINEX header: "
-                    f"{station_info['latitude']:.4f}°N, {station_info['longitude']:.4f}°E, "
-                    f"{station_info['altitude']:.1f}m ({station_info['marker_name']})</span>"
-                )
+            info = extract_station_info(self.scan_result.get('ubx_dir'))
         except Exception as e:
-            self.validation_label.setText(
-                self.validation_label.text() + 
-                f"<br><span style='color:#F57C00'>⚠ Could not read station position from RINEX: {e}</span>"
-            )
+            self._append_note(f"⚠ Receiver position unreadable: {e}", '#F57C00')
+        if info is None:
+            if cra_has_coords:
+                self._append_note("⚠ No receiver fix — .cra position used", '#F57C00')
+            else:
+                self._append_note("✗ No station position — enter it below", '#D32F2F')
+            return
+        name = (cra_data or {}).get('STATION_NAME') or ''         # site name only from the .cra
+        self.station_panel.load_from_rinex_station({**info, 'marker_name': name})
+        h_show = info.get('altitude_msl') if info.get('altitude_msl') is not None else info['altitude']
+        detail = f"{info['latitude']:.4f}°N {info['longitude']:.4f}°E · {h_show:.0f} m · receiver fix"
+        if info.get('altitude_msl') is None:
+            detail += " (ellipsoidal h)"
+        if (info.get('max_file_spread_m') or 0) > 5.0:
+            self._append_note(f"⚠ Files up to {info['max_file_spread_m']:.0f} m apart — each uses its own fix",
+                              '#F57C00')
+        self._append_note(f"✓ Station {detail}")
+        if cra_has_coords:
+            try:
+                h_rec = info.get('altitude_msl') if info.get('altitude_msl') is not None else info['altitude']
+                a = np.array(geodetic_to_ecef_gui(float(cra_data['STATION_LAT']), float(cra_data['STATION_LON']),
+                                                  float(cra_data['STATION_HEIGHT'])))      # GPS heights both
+                b = np.array(geodetic_to_ecef_gui(info['latitude'], info['longitude'], h_rec))
+                off = float(np.linalg.norm(a - b))
+                warn_m = float(load_processing_config_from_cra(cra_data).get('STATION_MISMATCH_WARN_M', 100.0))
+                if off > warn_m:
+                    self._append_note(f"⚠ .cra position {off / 1000:.2f} km from the receiver — receiver used",
+                                      '#F57C00')
+            except (TypeError, ValueError, KeyError):
+                pass
 
     # ------------------------------------------------------------------
     # v3.4.4 — Load-mode (open a previously executed *_output project)
@@ -1984,14 +2162,10 @@ class MainWindow(QMainWindow):
         self.stop_btn.setVisible(False)
 
         # Compose status message.
-        msgs = ["<span style='color:#00695C; font-weight:bold;'>📂 Loaded previous results</span>"]
-        if out_info['data_type'] == DataType.GROUND:
-            msgs.append(f"<span style='color:#1976D2'>📡 {GROUND_DISPLAY_NAME} project</span>")
-        elif out_info['data_type'] == DataType.SATELLITE:
-            msgs.append("<span style='color:#7B1FA2'>🛰 Satellite project</span>")
-        elif out_info['data_type'] == DataType.BOTH:
-            msgs.append(f"<span style='color:#00796B'>"
-                        f"📡🛰 {GROUND_DISPLAY_NAME} + Satellite project</span>")
+        _remember_dir(directory)
+        kind = {DataType.GROUND: f"📡 {GROUND_DISPLAY_NAME}", DataType.SATELLITE: "🛰 Satellite",
+                DataType.BOTH: f"📡🛰 {GROUND_DISPLAY_NAME} + Satellite"}.get(out_info['data_type'], '')
+        msgs = [f"<span style='color:#00695C; font-weight:bold;'>📂 Loaded results · {kind}</span>"]
         for w in out_info.get('warnings', []):
             msgs.append(f"<span style='color:#F57C00'>⚠ {w}</span>")
         for e in out_info.get('errors', []):
@@ -2004,8 +2178,12 @@ class MainWindow(QMainWindow):
         self.ground_output_dir = out_info.get('ground_dir')
         self.sat_output_dir = out_info.get('sat_dir')
 
+        self.ground_reasons = {}
         if self.ground_output_dir:
-            self.ground_ro_status = load_ground_ro_status_from_csv(self.ground_output_dir)
+            try:
+                self.ground_ro_status, self.ground_reasons = build_ground_status(self.ground_output_dir)
+            except Exception:
+                self.ground_ro_status = load_ground_ro_status_from_csv(self.ground_output_dir)
         if self.sat_output_dir:
             self.sat_summary_df = load_sat_summary_from_csv(self.sat_output_dir)
 
@@ -2021,16 +2199,7 @@ class MainWindow(QMainWindow):
         }
 
         # Populate the result list using the same widgets as execute-mode.
-        dt = out_info['data_type']
-        if dt == DataType.GROUND:
-            self.result_list.populate_ground(self.ground_ro_status)
-            self.legend_label.setText("● RO + profile    ○ No profile / no RO  (loaded)")
-        elif dt == DataType.SATELLITE:
-            self.result_list.populate_satellite(self.sat_summary_df)
-            self.legend_label.setText("● Success    ○ Failed  (loaded from disk)")
-        elif dt == DataType.BOTH:
-            self.result_list.populate_both(self.ground_ro_status, self.sat_summary_df)
-            self.legend_label.setText("Ground: ● RO + profile / ○ no profile / no RO | Sat: ●/○  (loaded)")
+        self._populate_results()
 
         self.raw_canvas.show_placeholder("Select an item to view observations")
         self.derived_canvas.show_placeholder("Select an item to view profiles")
@@ -2046,6 +2215,7 @@ class MainWindow(QMainWindow):
             return
         self.load_mode = False
         self.load_info = None
+        self._clear_results_extras()
         self.run_btn.setText("Start Processing")
         self.stop_btn.setVisible(True)
         self.progress_panel.setVisible(True)
@@ -2063,6 +2233,7 @@ class MainWindow(QMainWindow):
         self.output_dir = None
         self.run_btn.setEnabled(False)
         self.result_list.clear()
+        self._clear_results_extras()
         self.station_panel.setVisible(False)
         self.processing_panel.setVisible(False)
 
@@ -2075,8 +2246,12 @@ class MainWindow(QMainWindow):
         if has_ground:
             station = self.station_panel.get_station_config()
             if not station:
-                QMessageBox.warning(self, "Configuration Error",
-                                  "Please enter valid station coordinates for ground data.")
+                QMessageBox.warning(
+                    self, "No station position",
+                    "No station position could be found:\n"
+                    "• no metadata.cra with coordinates, and\n"
+                    "• no usable receiver position in the data (UBX 3D fix / RINEX APPROX POSITION).\n\n"
+                    "Enter Lat / Lon / Altitude in the Station panel and run again.")
                 return
 
             # v3.4.4 — Persist the user's settings non-destructively.
@@ -2086,15 +2261,20 @@ class MainWindow(QMainWindow):
             processing_to_save = self.processing_panel.to_processing_dict()
             cra_path = self.scan_result['metadata_file']
             if not cra_path:
+                # v4.3: no .cra yet -> create it with every default, so the file
+                # documents all settings the run used.
                 cra_path = os.path.join(self.input_dir, 'metadata.cra')
+                processing_to_save = {**load_processing_config_from_cra({}), **processing_to_save}
             merge_save_metadata(
                 cra_path,
                 station_fields=self.station_panel.to_metadata(),
                 processing_fields=processing_to_save,
             )
             self.scan_result['metadata_file'] = cra_path
-            # Stash for child process and for end-of-run cleanup.
-            self._current_processing_cfg = processing_to_save
+            # v4.3: the child gets the COMPLETE PROCESSING (defaults + whole .cra),
+            # not only the keys shown in the panel.
+            self._current_processing_cfg = load_processing_config_from_cra(load_metadata(cra_path) or {})
+            apply_processing_config(self._current_processing_cfg)       # same rules in this process
             self._keep_intermediate = self.processing_panel.keep_intermediate()
         else:
             self._current_processing_cfg = dict(PROCESSING_DEFAULTS)
@@ -2146,6 +2326,8 @@ class MainWindow(QMainWindow):
         self.sat_success = False
         self.ground_intermediate_data = None
         self.ground_ro_status = {}
+        self.ground_reasons = {}
+        self.ground_message = ''
         self.sat_summary_df = None
         
         # Setup multiprocessing
@@ -2157,8 +2339,10 @@ class MainWindow(QMainWindow):
             station_dict = {
                 'latitude': station.latitude,
                 'longitude': station.longitude,
-                'altitude': station.altitude,
-                'name': station.name
+                'altitude': station.altitude,              # GPS height; converted in the pipeline
+                'name': station.name,
+                'height_ref': station.height_ref,
+                'geoid_sep_m': station.geoid_sep_m,
             }
             
             self.ground_process = mp.Process(
@@ -2217,14 +2401,12 @@ class MainWindow(QMainWindow):
                     if pipeline_type == 'ground':
                         self.ground_done = True
                         self.ground_success = success
+                        self.ground_message = message
                         if success and result_path and os.path.exists(result_path):
                             self.ground_intermediate_data = pd.read_csv(result_path)
-                            bool_status = evaluate_ro_status(self.ground_intermediate_data)
-                            # v3.4.4.1 — upgrade to tri-state: RO sats whose
-                            # bending profile is empty are downgraded to yellow.
-                            self.ground_ro_status = classify_ground_ro_status(
-                                self.ground_output_dir, bool_status
-                            )
+                            # v4.3: events, single-frequency flag and skip reasons
+                            self.ground_ro_status, self.ground_reasons = build_ground_status(
+                                self.ground_output_dir, self.ground_intermediate_data)
                     
                     elif pipeline_type == 'satellite':
                         self.sat_done = True
@@ -2277,18 +2459,8 @@ class MainWindow(QMainWindow):
         self.browse_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
-        # Populate result list
-        data_type = self.scan_result['data_type']
-        
-        if data_type == DataType.GROUND:
-            self.result_list.populate_ground(self.ground_ro_status)
-            self.legend_label.setText("● RO + profile    ○ No profile / no RO")
-        elif data_type == DataType.SATELLITE:
-            self.result_list.populate_satellite(self.sat_summary_df)
-            self.legend_label.setText("● Success    ○ Failed    [VAL] Has validation")
-        elif data_type == DataType.BOTH:
-            self.result_list.populate_both(self.ground_ro_status, self.sat_summary_df)
-            self.legend_label.setText("Ground: ● RO + profile / ○ no profile / no RO | Satellite: ●/○")
+        # Populate result list (3.5.2: summary, hidden items, quality card, report)
+        self._populate_results()
         
         self.raw_canvas.show_placeholder("Select an item to view")
         self.derived_canvas.show_placeholder("Select an item to view profiles")
@@ -2297,16 +2469,18 @@ class MainWindow(QMainWindow):
         # Summary message
         msg_parts = []
         if self.ground_success:
-            # v3.4.4.1 — tri-state-aware counters.
-            green = sum(1 for v in self.ground_ro_status.values() if v == 'ro_ok' or v is True)
-            yellow = sum(1 for v in self.ground_ro_status.values() if v == 'ro_empty')
-            if yellow:
-                msg_parts.append(
-                    f"Ground: {len(self.ground_ro_status)} satellites "
-                    f"({green} RO with profile, {yellow} RO without profile)"
-                )
-            else:
-                msg_parts.append(f"Ground: {len(self.ground_ro_status)} satellites ({green} RO)")
+            st = [_norm_ground_state(v) for v in self.ground_ro_status.values()]
+            dual, single, empty = st.count('ro_ok'), st.count('ro_ok_1f'), st.count('ro_empty')
+            line = f"Ground: {len(st)} items — {dual} profiles (dual-frequency)"
+            if single:
+                line += f", {single} SINGLE-FREQUENCY profiles (no ionospheric correction)"
+            if empty:
+                line += f", {empty} RO candidates without profile"
+            msg_parts.append(line)
+            if getattr(self, 'ground_message', ''):
+                msg_parts.append(self.ground_message)
+        elif self.scan_result['data_type'] in (DataType.GROUND, DataType.BOTH):
+            msg_parts.append(f"Ground FAILED: {getattr(self, 'ground_message', '')}")
         if self.sat_success and self.sat_summary_df is not None:
             success_count = self.sat_summary_df['success'].sum()
             msg_parts.append(f"Satellite: {success_count}/{len(self.sat_summary_df)} events")
@@ -2317,6 +2491,57 @@ class MainWindow(QMainWindow):
                 "\n".join(msg_parts) + f"\n\nResults saved to:\n{self.output_dir}"
             )
     
+    # ------------------------------------------------------------------
+    # 3.5.2 — results summary, hidden items, session quality, report
+    # ------------------------------------------------------------------
+    def _clear_results_extras(self):
+        self.summary_label.setText("")
+        self.show_all_cb.setVisible(False)
+        self.quality_label.setVisible(False)
+
+    def _populate_results(self):
+        dt = (self.load_info or {}).get('data_type') if self.load_mode else (self.scan_result or {}).get('data_type')
+        status = self.ground_ro_status or {}
+        hidden = ground_hidden_items(self.ground_output_dir, status) if status else set()
+        show = hidden if self.show_all_cb.isChecked() else set()
+        hide = hidden - show
+        if dt == DataType.GROUND:
+            self.result_list.populate_ground(status, hidden=hide)
+            self.legend_label.setText(GROUND_LEGEND)
+        elif dt == DataType.SATELLITE:
+            self.result_list.populate_satellite(self.sat_summary_df)
+            self.legend_label.setText("● Success    ○ Failed    [VAL] Has validation")
+        elif dt == DataType.BOTH:
+            self.result_list.populate_both(status, self.sat_summary_df, hidden=hide)
+            self.legend_label.setText("Ground: " + GROUND_LEGEND + " | Satellite: ●/○")
+        has_ground = bool(status) and dt in (DataType.GROUND, DataType.BOTH)
+        if has_ground:
+            st = [_norm_ground_state(v) for v in status.values()]
+            prof = st.count('ro_ok') + st.count('ro_ok_1f')
+            self.summary_label.setText(
+                f"<b>{prof} profile{'s' if prof != 1 else ''}</b> · {st.count('ro_empty')} RO, no profile · "
+                f"{st.count('no_ro') - len(hidden)} not RO" + (f" · {len(hidden)} never below 5°" if hidden else ''))
+            self.show_all_cb.setVisible(bool(hidden))
+            q = {}
+            qf = os.path.join(self.ground_output_dir or '', 'session_quality.json')
+            try:
+                if os.path.exists(qf):
+                    q = json.load(open(qf))
+                else:
+                    s4 = os.path.join(self.ground_output_dir or '', 'step4_differenced.csv')
+                    if os.path.exists(s4):
+                        q = session_quality(pd.read_csv(s4, usecols=lambda c: c in (
+                            'sat_id', 'gnssId', 'svId', 'sigID', 'timestamp', 'utc',
+                            'accurate_elevation', 'accurate_azimuth')))
+            except Exception:
+                q = {}
+            lines = session_quality_lines(q)
+            self.quality_label.setText("<b>Session</b><br>" + "<br>".join(
+                (f"<span style='color:#B35C00'>{l}</span>" if l.startswith('⚠') else l) for l in lines))
+            self.quality_label.setVisible(bool(lines))
+        else:
+            self._clear_results_extras()
+
     def _on_item_selected(self, item: QListWidgetItem):
         if item is None:
             return
@@ -2360,29 +2585,31 @@ class MainWindow(QMainWindow):
 
         if item_type == 'ground':
             plots_dir = os.path.join(self.ground_output_dir, 'plots')
+            reason = (getattr(self, 'ground_reasons', {}) or {}).get(item_id, '')
+            sat_of_item = re.sub(r'_e\d+$', '', item_id)       # GPS_7_e2 -> GPS_7
 
             if current_tab == 0:
-                raw_path = os.path.join(plots_dir, f'{item_id}_raw.png')
+                raw_path = os.path.join(plots_dir, f'{sat_of_item}_raw.png')
                 self.raw_canvas.load_from_png(raw_path)
             elif current_tab == 1:
                 if is_success:
                     derived_path = os.path.join(plots_dir, f'{item_id}_derived.png')
                     self.derived_canvas.load_from_png(derived_path)
+                elif os.path.exists(os.path.join(plots_dir, f'{item_id}_derived.png')):
+                    # v4.6: page with every RO test, pass / fail, values
+                    self.derived_canvas.load_from_png(os.path.join(plots_dir, f'{item_id}_derived.png'))
                 elif ro_state == 'ro_empty':
-                    # v3.4.4.1 — yellow: RO geometry was detected, but the
-                    # bending retrieval produced no usable profile.
                     self.derived_canvas.show_placeholder(
-                        f"Bending retrieval did not converge for {item_id}\n\n"
-                        "RO geometry was detected, but no profile data is\n"
-                        "available to display."
-                    )
+                        f"No profile for {item_id}\n\n"
+                        "RO candidate, but the retrieval was stopped:\n" + _wrap_reason(reason))
                 else:
                     self.derived_canvas.show_placeholder(
-                        f"No radio occultation detected for {item_id}\n\n"
-                        "Atmospheric profiles require RO geometry:\n"
-                        "• Elevation below the RO threshold\n"
-                        "• Sufficient atmospheric Doppler\n"
-                        "• Enough valid epochs"
+                        f"No radio occultation for {item_id}\n\n"
+                        "An RO candidate needs:\n"
+                        "• epochs below the RO elevation threshold, some below 0°\n"
+                        "• both frequencies of its pair (or 'Allow single-frequency')\n"
+                        "• a reference satellite of the same constellation\n"
+                        "• the track crossing the apparent horizon (≈ −0.5° on a mountain)"
                     )
             elif current_tab == 2:
                 if is_success:
@@ -2390,10 +2617,8 @@ class MainWindow(QMainWindow):
                     self.atm_canvas.load_from_png(atm_path)
                 elif ro_state == 'ro_empty':
                     self.atm_canvas.show_placeholder(
-                        f"Bending retrieval did not converge for {item_id}\n\n"
-                        "RO geometry was detected, but no profile data is\n"
-                        "available to display."
-                    )
+                        f"No profile for {item_id}\n\n" + _wrap_reason(reason) +
+                        "\n\nThe Radio Occultation tab lists every RO test.")
                 else:
                     self.atm_canvas.show_placeholder(
                         f"No radio occultation detected for {item_id}\n\n"
