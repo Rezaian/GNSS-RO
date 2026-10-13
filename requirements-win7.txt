@@ -1,0 +1,11 @@
+# GNSS-RO 3.5.5 — Windows 7 SP1 / old Windows 10 build (64-bit), Python 3.8
+# Same pins as .github/workflows/build.yml. Tested on Python 3.8 + PyQt5:
+# synthetic suite 6/6, real UBX session, GUI test 15/15.
+pyinstaller==6.3.0
+pyqt5==5.15.11
+numpy==1.24.4
+pandas==2.0.3
+matplotlib==3.7.5
+scipy==1.10.1
+netCDF4==1.6.5
+xarray==2023.1.0

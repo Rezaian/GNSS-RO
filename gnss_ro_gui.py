@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GNSS Radio Occultation Processing GUI  3.5.2
+GNSS Radio Occultation Processing GUI  3.5.5
 ==============================================
 
 Supports both ground-based and satellite-based (LEO) GNSS-RO processing.
@@ -16,7 +16,7 @@ Features:
 import sys
 import os
 
-__version__ = "3.5.2"
+__version__ = "3.5.5"
 import re
 import json
 import glob
@@ -67,7 +67,7 @@ from ground_gnss_ro_pipeline import (
     retrieve_refractivity, compare_with_era5, retrieve_atmospheric_profile,
     PROCESSING_DEFAULTS, load_processing_config_from_cra, apply_processing_config,
     extract_station_info,
-    session_quality, session_quality_lines, load_ro_checks,
+    session_quality, session_quality_lines, load_ro_checks, SHOW_RO_CHECKS,
 )
 
 from sat_gnss_ro_pipeline import (
@@ -763,7 +763,12 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
         os.makedirs(output_dir, exist_ok=True)
         station = StationConfig(**station_dict)
         log("=" * 60)
-        log("GROUND-BASED GNSS-RO Pipeline")
+        log(f"GROUND-BASED GNSS-RO Pipeline  -  version {__version__}")
+        try:
+            import platform, numpy as _np, pandas as _pd
+            log(f"Python {platform.python_version()} on {platform.platform()} · NumPy {_np.__version__} · pandas {_pd.__version__}")
+        except Exception:
+            pass
         log("=" * 60)
         log(f"Station (GUI): {station.name} {station.latitude:.6f}N {station.longitude:.6f}E GPS height {station.altitude:.1f} m")
         if processing_cfg:
@@ -845,7 +850,8 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
         except Exception:
             status_, reasons_ = {}, {}
         bdir = os.path.join(output_dir, 'bending')
-        for item, state in status_.items():
+        from ground_gnss_ro_pipeline import SHOW_RO_CHECKS
+        for item, state in (status_.items() if SHOW_RO_CHECKS else ()):
             if _norm_ground_state(state) in ('ro_empty', 'no_ro'):
                 generate_ro_checklist_plot(item, load_ro_checks(bdir, item),
                                            os.path.join(plots_dir, f'{item}_derived.png'), reasons_.get(item, ''))
@@ -1727,7 +1733,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"GNSS Radio Occultation Processor {__version__}")
+        self.setWindowTitle(f"GNSS Radio Occultation Processor v{__version__}")
 
         # v3.4.7 — a 1200x800 minimum does not fit a 1366x768 laptop: the
         # window was forced taller than the desktop and the bottom of the
@@ -1943,6 +1949,12 @@ class MainWindow(QMainWindow):
         result_layout.addWidget(self.quality_label)
 
         sidebar_layout.addWidget(result_group, 1)
+
+        # 3.5.5 — version always visible in the window
+        self.version_label = QLabel(f"v{__version__}")
+        self.version_label.setStyleSheet(f"QLabel {{ color: #9E9E9E; font-size: {FS_RESULT_NOTE}px; }}")
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        sidebar_layout.addWidget(self.version_label)
         
         splitter.addWidget(sidebar)
         
@@ -2597,7 +2609,7 @@ class MainWindow(QMainWindow):
                 if is_success:
                     derived_path = os.path.join(plots_dir, f'{item_id}_derived.png')
                     self.derived_canvas.load_from_png(derived_path)
-                elif os.path.exists(os.path.join(plots_dir, f'{item_id}_derived.png')):
+                elif SHOW_RO_CHECKS and os.path.exists(os.path.join(plots_dir, f'{item_id}_derived.png')):
                     # v4.6: page with every RO test, pass / fail, values
                     self.derived_canvas.load_from_png(os.path.join(plots_dir, f'{item_id}_derived.png'))
                 elif ro_state == 'ro_empty':

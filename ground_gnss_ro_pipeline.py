@@ -1,8 +1,8 @@
 """
-GNSS Radio Occultation Processing Pipeline 3.5.2 (mountain-top / ground-based)
+GNSS Radio Occultation Processing Pipeline 3.5.5 (mountain-top / ground-based)
 ==============================================================================
 
-Release 3.5.2. Change notes in the code tagged v4.x are the pipeline's internal
+Release 3.5.5. Change notes in the code tagged v4.x are the pipeline's internal
 revisions leading to this release (v4.7 = 3.5.1; 3.5.2 = UI and report additions).
 
 Receiver: stationary, INSIDE the atmosphere (n_r != 1). Retrieves the profile
@@ -54,7 +54,29 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline, interp1d
 
-__version__ = "3.5.2"
+# ---------------------------------------------------------------------------
+# 3.5.5 — compatibility with older NumPy / pandas (Windows 7 / old Windows 10:
+# Python 3.8, NumPy 1.2x, pandas 1.x)
+# ---------------------------------------------------------------------------
+_trapz = getattr(np, 'trapezoid', None) or np.trapz      # np.trapezoid is NumPy >= 2.0
+
+
+_PANDAS_2 = int(pd.__version__.split('.')[0]) >= 2
+
+
+def _to_datetime(values, **kw):
+    """pd.to_datetime for mixed ISO strings: format='mixed' on pandas >= 2.0; older
+    pandas parses mixed ISO strings by default (and would silently turn every value
+    into NaT if given format='mixed' with errors='coerce')."""
+    if _PANDAS_2:
+        return pd.to_datetime(values, format='mixed', **kw)
+    return pd.to_datetime(values, **kw)
+
+__version__ = "3.5.5"
+
+# 3.5.5: RO status checklist (Panel 2 "RO tests" strip and the checklist pages for
+# items without a profile) temporarily disabled. ro_checks.json is still written.
+SHOW_RO_CHECKS = False
 
 warnings.filterwarnings('ignore')
 
@@ -2251,7 +2273,7 @@ def match_observations_with_sp3(
     that uses it, instead of once per row.
     """
     df = pd.read_csv(obs_csv)
-    df['parsed_utc'] = pd.to_datetime(df['utc'], format='mixed', errors='coerce')
+    df['parsed_utc'] = _to_datetime(df['utc'], errors='coerce')
     if getattr(df['parsed_utc'].dt, 'tz', None) is not None:
         df['parsed_utc'] = df['parsed_utc'].dt.tz_convert('UTC').dt.tz_localize(None)
     df = df.dropna(subset=['parsed_utc']).reset_index(drop=True)
@@ -3139,7 +3161,7 @@ def alpha_P_model(a: np.ndarray, r_r: float, h_tab: np.ndarray, N_tab: np.ndarra
     for i, ai in enumerate(np.atleast_1d(a)):
         q = (n * r) ** 2 - ai * ai
         g = np.where(q > 0, ai * (-dndr) / (n * np.sqrt(np.maximum(q, 1e-30))) * 2.0 * t, 0.0)
-        out[i] = np.trapezoid(g, t)
+        out[i] = _trapz(g, t)
     return out
 
 
@@ -3325,7 +3347,7 @@ class BendingAngleRetriever:
             utc = merged['utc_f1'].values
 
             # v4.5: this occultation's own receiver fix and station met (its own time)
-            _ut = pd.to_datetime(pd.Series(utc), format='mixed', errors='coerce').dropna()
+            _ut = _to_datetime(pd.Series(utc), errors='coerce').dropna()
             ev_utc = str(_ut.iloc[len(_ut) // 2]) if not _ut.empty else None
             st = self._event_station(merged, ev_utc)
             r_rec = st.to_ecef()
@@ -3713,7 +3735,7 @@ def tangent_point_central_angle(a_vals: np.ndarray, x_tab: np.ndarray, r_tab: np
         xx = np.sqrt(a * a + u * u)
         rr = np.interp(xx, x_tab, r_tab)
         dd = np.interp(xx, x_tab, drdx)
-        out[i] = np.trapezoid(a * dd / (rr * xx), u)
+        out[i] = _trapz(a * dd / (rr * xx), u)
     return out
 
 
@@ -4171,7 +4193,7 @@ def session_quality(df: pd.DataFrame) -> Dict[str, Any]:
     q.update({'rate_hz': rate['rate_hz'], 'n_gaps': rate['n_gaps'], 'gap_time_s': rate['gap_time_s'],
               'duration_min': float((t.max() - t.min()) / 60.0) if t.notna().any() else np.nan})
     if 'utc' in d.columns:
-        u = pd.to_datetime(d['utc'], format='mixed', errors='coerce').dropna()
+        u = _to_datetime(d['utc'], errors='coerce').dropna()
         if not u.empty:
             q['utc_start'], q['utc_end'] = str(u.min())[:19], str(u.max())[:19]
     mins = d.groupby('sat_id')[el_c].min()
@@ -4445,7 +4467,7 @@ def generate_raw_plots(sat_data: pd.DataFrame, sat_id: str, output_path: str, dp
         return False
     site = site or {}
     df = sat_data.copy()
-    df['utc_parsed'] = pd.to_datetime(df['utc'], format='mixed', errors='coerce') if 'utc' in df.columns else pd.NaT
+    df['utc_parsed'] = _to_datetime(df['utc'], errors='coerce') if 'utc' in df.columns else pd.NaT
     elev_col = 'accurate_elevation' if 'accurate_elevation' in df.columns else 'elevation'
     sigs = list(pd.unique(df['sigID'])) if 'sigID' in df.columns else []
     pair = list(FREQ_PAIRS.get(sat_id.split('_')[0], ()))
@@ -4984,7 +5006,7 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         if fl & {'l1', 'mod'}:
             h.append(Line2D([], [], markerfacecolor='white', **base)); l.append(FLAG_TXT_L1)
         ax_.legend(h, l, **kw)
-    info = load_ro_checks(os.path.dirname(sat_results.get('bending_csv') or ''), sat_id)
+    info = load_ro_checks(os.path.dirname(sat_results.get('bending_csv') or ''), sat_id) if SHOW_RO_CHECKS else None
     if info and info.get('checks'):
         fig.text(0.015, y_next, 'RO tests', fontsize=9, fontweight='bold', color=PLOT_INK, va='center')
         y_next = _checks_strip(fig, info['checks'], y_next, x0=0.075, width=0.91, fontsize=8.6)
@@ -5208,7 +5230,7 @@ class GNSSROPipeline:
             # v4.5: station met is taken per occultation, at its own time and place
             self.met_fn = lambda ev_st, when, _f=era5_file: era5_station_met(
                 _f, ev_st.latitude, ev_st.longitude, ev_st.altitude - ev_st.geoid_sep_m, when)
-            utc = pd.to_datetime(df1['utc'], format='mixed', errors='coerce').dropna()
+            utc = _to_datetime(df1['utc'], errors='coerce').dropna()
             when = str(utc.iloc[len(utc) // 2]) if not utc.empty else None
             met = era5_station_met(era5_file, st.latitude, st.longitude, st.altitude - st.geoid_sep_m, when)
             if met:
