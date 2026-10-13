@@ -240,7 +240,8 @@ BRANCH_GUARD_DEG = 0.15          # deg: epochs this close to the apparent horizo
 MIN_VP = 50.0                    # m/s: min in-plane transmitter velocity normal to the LOS
 EVENT_GAP_S = 300.0              # s: a gap longer than this starts a new occultation event
 SMOOTH_ELEV_MAX_DEG = 90.0       # deg: smooth atmos Doppler only below this elevation (90 = all; plots need all)
-ALPHA_P_MODEL = 'off'            # 3.5.1: model alpha_P dropped (always 'off'); kept for research use only.
+MAX_NC_DISTANCE_KM = 250.0       # km: a .nc column (grid point or radiosonde) is used only within this distance
+ALPHA_P_MODEL = 'fill'           # alpha_P from a model atmosphere where no above-horizon ray: 'off' | 'fill' | 'always'
 # alpha_P from a model atmosphere: 'off' | 'fill' (only where not measured) | 'always'
 ALPHA_P_WET_H_M = 2000.0         # m: water-vapour scale height of the model atmosphere when ERA5 is not available
 ALLOW_SINGLE_FREQ = True         # use single-frequency events (no ionospheric correction) when dual is missing
@@ -285,6 +286,9 @@ PROCESSING_DEFAULTS = {
     'STATION_SPLIT_WARN_M': 5.0,      # Note when the folder's files come from positions further apart (m).
     'BRANCH_GUARD_DEG': 0.15,         # Epochs this close to the apparent horizon are not used (deg).
     'BRANCH_AMBIGUOUS_DEG': 1.0,      # Below -this elevation a ray always has its tangent point below the station (deg).
+    'MAX_NC_DISTANCE_KM': 250.0,      # Use a .nc column (nearest grid point, or a single radiosonde) only within this distance of the tangent point / station (km).
+    'ALPHA_P_MODEL': 'fill',          # alpha_P from a model atmosphere (.nc column or standard) where no above-horizon ray: 'off' | 'fill' | 'always'.
+    'ALPHA_P_WET_H_M': 2000.0,        # Water-vapour scale height of the model atmosphere when no .nc file (m).
     'ALLOW_SINGLE_FREQ': True,        # Single-frequency events when dual is missing (no ionospheric correction; flagged).
     'SMOOTH_ELEV_MAX_DEG': 90.0,       # Smooth atmos Doppler below this elevation (90 = all; lower = faster).
 
@@ -337,7 +341,7 @@ def apply_processing_config(cfg: Dict) -> None:
     global A_BIN_M, IONO_SMOOTH_BINS, BRANCH_SMOOTH, MIN_VP, OBS_TIME_IS_GPS
     global FORCE_CRA_STATION_COORDS
     global REF_MODE, STATION_SPLIT_WARN_M
-    global ALPHA_P_MODEL, ALPHA_P_WET_H_M, DERIVED_DOPPLER_OUT_S
+    global ALPHA_P_MODEL, ALPHA_P_WET_H_M, DERIVED_DOPPLER_OUT_S, MAX_NC_DISTANCE_KM
     global SMOOTH_ELEV_MAX_DEG, ALLOW_SINGLE_FREQ, BRANCH_GUARD_DEG, BRANCH_AMBIGUOUS_DEG
     global REF_SAT_ELEVATION_THRESHOLD, REF_SAT_MIN_EPOCHS, REF_SAT_JUMP_THRESHOLD
     global EVENT_GAP_S, STATION_MISMATCH_WARN_M, UBX_POS_MAX_HACC_M, UBX_POS_MAX_VACC_M, UBX_POS_MIN_FIXES
@@ -363,9 +367,12 @@ def apply_processing_config(cfg: Dict) -> None:
     EVENT_GAP_S            = float(cfg.get('EVENT_GAP_S', EVENT_GAP_S))
     SMOOTH_ELEV_MAX_DEG    = float(cfg.get('SMOOTH_ELEV_MAX_DEG', SMOOTH_ELEV_MAX_DEG))
     ALLOW_SINGLE_FREQ      = bool(cfg.get('ALLOW_SINGLE_FREQ', ALLOW_SINGLE_FREQ))
-    ALPHA_P_MODEL          = 'off'      # 3.5.1: feature dropped; old .cra values are ignored
+    ALPHA_P_MODEL          = str(cfg.get('ALPHA_P_MODEL', ALPHA_P_MODEL)).lower()
+    if ALPHA_P_MODEL in ('true', '1', 'yes'): ALPHA_P_MODEL = 'fill'
+    if ALPHA_P_MODEL in ('false', '0', 'no', 'none'): ALPHA_P_MODEL = 'off'
     DERIVED_DOPPLER_OUT_S  = 0.0        # 3.5.2: always the recorded rate (no thinning); old .cra values ignored
     ALPHA_P_WET_H_M        = float(cfg.get('ALPHA_P_WET_H_M', ALPHA_P_WET_H_M))
+    MAX_NC_DISTANCE_KM     = float(cfg.get('MAX_NC_DISTANCE_KM', MAX_NC_DISTANCE_KM))
     REF_MODE               = str(cfg.get('REF_MODE', REF_MODE))
     STATION_SPLIT_WARN_M   = float(cfg.get('STATION_SPLIT_WARN_M', STATION_SPLIT_WARN_M))
     BRANCH_GUARD_DEG       = float(cfg.get('BRANCH_GUARD_DEG', BRANCH_GUARD_DEG))
@@ -1082,22 +1089,252 @@ def resolve_station(station: 'StationConfig', receiver_pos: Optional[Dict[str, f
     return new, note
 
 
+# ============================================================================
+# 3.5.2 — GENERIC .nc PROFILE SOURCE (gridded reanalysis or single radiosonde)
+# ============================================================================
+
+_NC_CACHE: Dict[Any, Dict[str, np.ndarray]] = {}
+_NC_NAMES = {
+    'lat':  ('latitude', 'lat', 'station_lat', 'launch_lat', 'LAT', 'Latitude'),
+    'lon':  ('longitude', 'lon', 'station_lon', 'launch_lon', 'LON', 'Longitude'),
+    'time': ('valid_time', 'time', 'launch_time', 'Time'),
+    'T':    ('t', 'ta', 'temperature', 'temp', 'air_temperature', 'TEMP', 'T'),
+    'P':    ('pressure_level', 'pressure', 'pres', 'p', 'air_pressure', 'PRES', 'level', 'isobaricInhPa', 'plev'),
+    'Z':    ('z', 'gh', 'zg', 'geopotential_height', 'gph', 'height', 'hght', 'alt', 'altitude', 'HGHT'),
+    'q':    ('q', 'hus', 'specific_humidity', 'SPFH'),
+    'rh':   ('r', 'rh', 'hur', 'relative_humidity', 'RELH'),
+    'td':   ('td', 'dewpoint', 'dew_point_temperature', 'dwpt', 'DWPT'),
+}
+
+
+def _nc_find(ds, key):
+    for nm in _NC_NAMES[key]:
+        if nm in ds.variables:
+            return nm
+    return None
+
+
+def _es_hpa(T_k):
+    Tc = np.asarray(T_k, float) - 273.15
+    return 6.1094 * np.exp(17.625 * Tc / (Tc + 243.04))
+
+
+def _haversine_km(la1, lo1, la2, lo2):
+    la1, lo1, la2, lo2 = map(np.radians, (la1, lo1, la2, lo2))
+    a = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
+def nc_columns(nc_file: str, when: Optional[str] = None) -> Dict[str, np.ndarray]:
+    """
+    Every profile column in a .nc file at the time nearest to `when`:
+      gridded reanalysis (ERA5-like: lat x lon x level)  -> one column per grid point
+      single profile (radiosonde: level only, position in a variable / attribute)
+                                                          -> one column
+    Returns lat (n), lon (n), Z (n, L) m above MSL, T (n, L) K, P (n, L) hPa,
+    q (n, L) kg/kg, 'kind' ('grid' | 'profile'), 'time' (str or '').
+    Units are recognised from attributes / magnitudes (Pa vs hPa, degC vs K,
+    geopotential vs metres, g/kg vs kg/kg, RH % vs fraction).
+    """
+    key = (nc_file, str(when)[:16] if when else None, os.path.getmtime(nc_file))
+    if key in _NC_CACHE:
+        return _NC_CACHE[key]
+    import xarray as xr
+    with xr.open_dataset(nc_file) as ds0:
+        ds = ds0
+        tname = _nc_find(ds, 'time')
+        t_used = ''
+        if tname and tname in ds.dims and ds.sizes[tname] > 0:
+            if when:
+                ts = pd.Timestamp(when)
+                if ts.tzinfo is not None:
+                    ts = ts.tz_convert('UTC').tz_localize(None)
+                try:
+                    ds = ds.sel({tname: ts.to_datetime64()}, method='nearest')
+                except Exception:
+                    ds = ds.isel({tname: 0})
+            else:
+                ds = ds.isel({tname: 0})
+            try:
+                t_used = str(pd.Timestamp(ds[tname].values))[:19]
+            except Exception:
+                t_used = ''
+        names = {k: _nc_find(ds, k) for k in _NC_NAMES}
+        if names['T'] is None:
+            raise ValueError("no temperature variable in the .nc file")
+        Tda = ds[names['T']]
+        la_n, lo_n = names['lat'], names['lon']
+        grid = (la_n in Tda.dims and lo_n in Tda.dims) if (la_n and lo_n) else False
+
+        def arr(nm):
+            return np.asarray(ds[nm].values, float) if nm else None
+
+        if grid:
+            lev_dim = [d for d in Tda.dims if d not in (la_n, lo_n)]
+            if len(lev_dim) != 1:
+                raise ValueError(f"cannot find the vertical dimension of {names['T']}: {Tda.dims}")
+            lev = lev_dim[0]
+
+            def col(nm):
+                return np.asarray(ds[nm].transpose(la_n, lo_n, lev).values, float).reshape(-1, ds.sizes[lev])
+            LA, LO = np.meshgrid(arr(la_n), arr(lo_n), indexing='ij')
+            lat, lon = LA.ravel(), LO.ravel()
+            T = col(names['T'])
+            ncol = T.shape[0]
+            P = (np.broadcast_to(np.asarray(ds[lev].values, float), T.shape).copy()
+                 if names['P'] in (None, lev) or (names['P'] and ds[names['P']].dims == (lev,))
+                 else col(names['P']))
+            Z = col(names['Z']) if names['Z'] else None
+            Q = col(names['q']) if names['q'] else None
+            RH = col(names['rh']) if (names['rh'] and Q is None) else None
+            TD = col(names['td']) if (names['td'] and Q is None and RH is None) else None
+            zunits = str(ds[names['Z']].attrs.get('units', '')) if names['Z'] else ''
+        else:
+            def pos(nm_key):
+                nm = names[nm_key]
+                if nm:
+                    v = np.asarray(ds[nm].values, float).ravel()
+                    v = v[np.isfinite(v)]
+                    if v.size:
+                        return float(np.median(v))
+                for a in _NC_NAMES[nm_key]:
+                    if a in ds.attrs:
+                        try:
+                            return float(ds.attrs[a])
+                        except (TypeError, ValueError):
+                            pass
+                return np.nan
+            lat, lon = np.array([pos('lat')]), np.array([pos('lon')])
+            if not (np.isfinite(lat[0]) and np.isfinite(lon[0])):
+                raise ValueError("single-profile .nc file has no latitude / longitude (variable or attribute)")
+            T = arr(names['T']).reshape(1, -1)
+            P = arr(names['P']).reshape(1, -1) if names['P'] else None
+            Z = arr(names['Z']).reshape(1, -1) if names['Z'] else None
+            Q = arr(names['q']).reshape(1, -1) if names['q'] else None
+            RH = arr(names['rh']).reshape(1, -1) if (names['rh'] and Q is None) else None
+            TD = arr(names['td']).reshape(1, -1) if (names['td'] and Q is None and RH is None) else None
+            zunits = str(ds[names['Z']].attrs.get('units', '')) if names['Z'] else ''
+            if P is None or Z is None:
+                raise ValueError("single-profile .nc file needs pressure and height")
+        punits = str(ds[names['P']].attrs.get('units', '')) if names['P'] else ''
+        tunits = str(Tda.attrs.get('units', ''))
+    # ---- units
+    if 'Pa' in punits and 'hPa' not in punits or np.nanmax(P) > 2000.0:
+        P = P / 100.0
+    if 'C' in tunits.upper() and 'K' not in tunits.upper() or np.nanmax(T) < 150.0:
+        T = T + 273.15
+    if Z is None:
+        raise ValueError("no height / geopotential variable in the .nc file")
+    is_geopot = ('m2' in zunits or 'm**2' in zunits or 'm^2' in zunits or 's-2' in zunits or 's**-2' in zunits)
+    if not is_geopot and 'm' not in zunits:          # no clear units: compare with the standard height of P
+        h_std = 44330.8 * (1.0 - (np.clip(P, 1.0, None) / 1013.25) ** 0.190263)
+        sel = np.isfinite(Z) & (h_std > 1000.0)
+        if sel.any():
+            is_geopot = float(np.nanmedian(Z[sel] / h_std[sel])) > 4.0      # ~9.8 for geopotential, ~1 for metres
+    if is_geopot:
+        Z = Z / 9.80665                               # geopotential -> geopotential metres
+    if Q is not None:
+        if np.nanmax(Q) > 0.5:
+            Q = Q / 1000.0                            # g/kg
+    elif RH is not None:
+        rh = RH / 100.0 if np.nanmax(RH) > 1.5 else RH
+        e = rh * _es_hpa(T)
+        Q = 0.622 * e / (P - 0.378 * e)
+    elif TD is not None:
+        if np.nanmax(TD) < 150.0:
+            TD = TD + 273.15
+        e = _es_hpa(TD)
+        Q = 0.622 * e / (P - 0.378 * e)
+    else:
+        Q = np.zeros_like(T)                          # no humidity: dry
+    out = {'lat': lat, 'lon': lon, 'Z': Z, 'T': T, 'P': P, 'q': Q,
+           'kind': 'grid' if grid else 'profile', 'time': t_used}
+    if grid:
+        out['lat_axis'], out['lon_axis'] = np.asarray(LA[:, 0]), np.asarray(LO[0, :])
+    if len(_NC_CACHE) > 32:
+        _NC_CACHE.clear()
+    _NC_CACHE[key] = out
+    return out
+
+
+def nc_at_points(nc_file: str, h_m, lat_pt, lon_pt, when: Optional[str] = None,
+                 max_km: Optional[float] = None) -> Dict[str, np.ndarray]:
+    """
+    T, q, P (and e, N) at heights h_m (m MSL) for each point (lat_pt[i], lon_pt[i]):
+    gridded file with the point inside the grid -> bilinear between the 4 grid
+    columns (dist 0); otherwise the NEAREST column (grid point or radiosonde),
+    used only within max_km (default MAX_NC_DISTANCE_KM), else NaN. Also returns dist_km, lat, lon
+    of the column used and 'used' (bool).
+    """
+    max_km = MAX_NC_DISTANCE_KM if max_km is None else float(max_km)
+    c = nc_columns(nc_file, when)
+    h = np.atleast_1d(np.asarray(h_m, float))
+    n = len(h)
+    la = np.broadcast_to(np.asarray(lat_pt, float), (n,))
+    lo = np.broadcast_to(np.asarray(lon_pt, float), (n,))
+    D = _haversine_km(la[:, None], lo[:, None], c['lat'][None, :], c['lon'][None, :])
+    j = np.nanargmin(np.where(np.isfinite(D), D, np.inf), axis=1)
+    d = D[np.arange(n), j]
+    used = np.isfinite(d) & (d <= max_km)
+    def vcol(jc, hh):
+        z, t, q, p = c['Z'][jc], c['T'][jc], c['q'][jc], c['P'][jc]
+        ok = np.isfinite(z) & np.isfinite(t) & np.isfinite(p)
+        if ok.sum() < 2:
+            return None
+        o = np.argsort(z[ok])
+        z, t, q, p = z[ok][o], t[ok][o], np.nan_to_num(q[ok][o]), p[ok][o]
+        if not (z[0] - 200.0 <= hh <= z[-1] + 200.0):
+            return None                               # outside the column's vertical range
+        return np.interp(hh, z, t), np.interp(hh, z, q), float(np.exp(np.interp(hh, z, np.log(p))))
+
+    out = {k: np.full(n, np.nan) for k in ('T', 'q', 'P')}
+    lat_used, lon_used = c['lat'][j].astype(float), c['lon'][j].astype(float)
+    la_ax, lo_ax = c.get('lat_axis'), c.get('lon_axis')
+    for i in np.where(used)[0]:
+        v = None
+        # gridded file and the point inside the grid: bilinear between the 4 surrounding columns
+        if la_ax is not None and len(la_ax) > 1 and len(lo_ax) > 1 \
+                and min(la_ax) <= la[i] <= max(la_ax) and min(lo_ax) <= lo[i] <= max(lo_ax):
+            ia = np.argsort(la_ax); io = np.argsort(lo_ax)
+            A, O = la_ax[ia], lo_ax[io]
+            k1 = int(np.clip(np.searchsorted(A, la[i]) - 1, 0, len(A) - 2))
+            k2 = int(np.clip(np.searchsorted(O, lo[i]) - 1, 0, len(O) - 2))
+            wa = (la[i] - A[k1]) / (A[k1 + 1] - A[k1]); wo = (lo[i] - O[k2]) / (O[k2 + 1] - O[k2])
+            acc, wsum = np.zeros(3), 0.0
+            for da_, wA in ((0, 1 - wa), (1, wa)):
+                for do_, wO in ((0, 1 - wo), (1, wo)):
+                    jc = ia[k1 + da_] * len(lo_ax) + io[k2 + do_]
+                    r_ = vcol(jc, h[i])
+                    if r_ is not None and wA * wO > 0:
+                        acc += wA * wO * np.array([r_[0], r_[1], np.log(r_[2])]); wsum += wA * wO
+            if wsum > 0.999:
+                acc /= wsum
+                v = (acc[0], acc[1], float(np.exp(acc[2])))
+                lat_used[i], lon_used[i], d[i] = la[i], lo[i], 0.0
+        if v is None:                                 # nearest column (radiosonde, or point outside the grid)
+            v = vcol(j[i], h[i])
+        if v is None:
+            used[i] = False
+            continue
+        out['T'][i], out['q'][i], out['P'][i] = v
+    out['e'] = out['q'] * out['P'] / (0.622 + 0.378 * out['q'])
+    out['N'] = N_COEFF_A1 * out['P'] / out['T'] + N_COEFF_A2 * out['e'] / out['T'] ** 2
+    out['used'] = used
+    out['dist_km'] = d
+    out['lat'], out['lon'] = lat_used, lon_used
+    out['kind'], out['time'] = c['kind'], c['time']
+    return out
+
+
 def era5_station_met(era5_file: str, lat: float, lon: float, h_m: float,
                      when: Optional[str] = None) -> Optional[Dict[str, float]]:
-    """P (hPa), T (K), e (hPa) at the station height from ERA5 (log-P interpolation in height)."""
+    """P (hPa), T (K), e (hPa) at the station height from the .nc column nearest the
+    station (3.5.2: only if within MAX_NC_DISTANCE_KM)."""
     try:
-        import xarray as xr
-        with xr.open_dataset(era5_file) as ds:
-            T_da, q_da, z_da, _ = _era5_extract(ds, lat, lon, when)
-            P = ds['pressure_level'].values.astype(float)
-            T, q, z = T_da.values.astype(float), q_da.values.astype(float), z_da.values / 9.80665
-        o = np.argsort(z)
-        z, P, T, q = z[o], P[o], T[o], q[o]
-        Ps = float(np.exp(np.interp(h_m, z, np.log(P))))
-        Ts = float(np.interp(h_m, z, T))
-        qs = float(np.interp(h_m, z, q))
-        es = qs * Ps / (0.622 + 0.378 * qs)
-        return {'P': Ps, 'T': Ts, 'e': es}
+        r = nc_at_points(era5_file, [h_m], [lat], [lon], when)
+        if not r['used'][0]:
+            return None
+        return {'P': float(r['P'][0]), 'T': float(r['T'][0]), 'e': float(r['e'][0])}
     except Exception:
         return None
 
@@ -2865,7 +3102,7 @@ def refractivity_table_above_station(N_r: float, h_tab_m: Optional[np.ndarray] =
             o = np.argsort(h); h, N = h[o], N[o]
             N = N * N_r / np.interp(0.0, h, N)
             k = max(1, len(h) // 5)
-            Hs = -(h[-1] - h[-k - 1]) / np.log(N[-1] / N[-k - 1]) if N[-1] < N[-k - 1] else scale_height_m
+            Hs = -(h[-1] - h[-k - 1]) / np.log(N[-1] / N[-k - 1]) if N[-1] < N[-k - 1] else 7000.0
             lo = grid[grid <= h[-1]]
             hi = grid[grid > h[-1]]
             Nlo = np.exp(np.interp(lo, h, np.log(N)))
@@ -3101,6 +3338,11 @@ class BendingAngleRetriever:
             az0 = float(np.degrees(np.angle(np.mean(np.exp(1j * np.radians(az))))) % 360.0)
             c0, R_c = curvature_centre(r_rec, st.latitude, st.longitude,
                                        st.altitude, az0)
+            # transmitter at TRANSMIT time, as in step 3b (audit 3.5.2): r_t - v_t * tau
+            tau = np.linalg.norm(r_sat - r_rec, axis=1) / SPEED_OF_LIGHT
+            for _ in range(2):                       # light-time iteration
+                tau = np.linalg.norm(r_sat - v_sat * tau[:, None] - r_rec, axis=1) / SPEED_OF_LIGHT
+            r_sat = r_sat - v_sat * tau[:, None]
             r_r = r_rec - c0
             x_r = n_r * float(np.linalg.norm(r_r))
 
@@ -3241,7 +3483,19 @@ class BendingAngleRetriever:
             # v4.5: per-channel partial bending (Hajj et al. 2002, Fig. 9 shows L1, L2, iono-free)
             partial_L1 = alN_L1 - np.where(p_model, alP_mod, alP_L1m)
             partial_L2 = alN_L2 - np.where(p_model, alP_mod, alP_L2m)
-            l1_only_lv = l1N | (l1P & ~p_model) if freq_mode == 'dual' else np.ones(len(aN), bool)
+            # 3.5.2 audit: the ionospheric bending is common to the N and P rays, so
+            # alpha_N(L1) - alpha_P(L1) cancels it (Healy et al. 2002). Never mix an
+            # L1-only side with an ionosphere-free side; a model alpha_P has no ionosphere.
+            if freq_mode == 'dual':
+                mixed = (l1N ^ l1P) & ~p_model & np.isfinite(partial_L1)
+                partial = np.where(mixed, partial_L1, partial)
+                l1_side = l1N | (l1P & ~p_model)
+                iono_method = np.where(~l1_side, 'iono-free',
+                                       np.where(p_model, 'not cancelled (L1 - model)', 'L1 difference'))
+            else:
+                iono_method = np.where(p_model, 'not cancelled (L1 - model)', 'L1 difference')
+            iono_ok = iono_method != 'not cancelled (L1 - model)'
+            l1_only_lv = ~iono_ok
             keep = np.isfinite(partial) & (aN < x_r)
             if keep.sum() < 3:
                 skipped[sat_id] = 'alpha_N and alpha_P do not overlap in impact parameter'
@@ -3295,7 +3549,8 @@ class BendingAngleRetriever:
                 'station_lon': st.longitude,
                 'geoid_sep_m': st.geoid_sep_m,
                 'freq_mode': freq_mode,                     # 'dual' | 'single'
-                'iono_corrected': ~l1_only_lv[keep],          # v4.7: per level (L1 fallback in L2 gaps)
+                'iono_corrected': iono_ok[keep],              # 3.5.2: False only where the ionosphere is not cancelled
+                'iono_method': iono_method[keep],             # iono-free | L1 difference | not cancelled (L1 - model)
                 'alpha_P_src': np.where(p_model[keep], 'model', 'measured'),
                 'alpha_P_model_rad': alP_mod[keep],
                 'alpha_P_measured_rad': alP_meas[keep],
@@ -3311,6 +3566,14 @@ class BendingAngleRetriever:
                 _ck(sat_id, 'Profile levels', False, '0 inside the height range', '≥ 1')
                 continue
             _ck(sat_id, 'Profile levels', True, f'{len(out_df)}', '≥ 1')
+            # 3.5.2 audit (QC, note only): alpha' should grow with depth; where it does not
+            # (super-refraction / multipath / noise) the Abel result is biased low.
+            if len(out_df) >= 4:
+                rho_d = float(pd.Series(-out_df['impact_parameter_m'].values).corr(
+                    pd.Series(out_df['bending_angle_rad'].values), method='spearman'))
+                if np.isfinite(rho_d) and rho_d < 0.3:
+                    _ck(sat_id, "Bending grows with depth (QC)", None,
+                        f"rank corr. {rho_d:+.2f} - possible super-refraction / multipath / noise", "corr. > 0.3")
 
             utc_N = pd.to_datetime(pd.Series(utc_ok[branch == -1]), errors='coerce').dropna()
             utc_mid = str(utc_N.iloc[len(utc_N) // 2]) if not utc_N.empty else ''
@@ -3665,60 +3928,21 @@ def _era5_extract(ds, lat, lon, when=None):
 def era5_at_levels(era5_file: str, h_m: np.ndarray, lat_lv, lon_lv, sta_lat: float, sta_lon: float,
                    when: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    v4.5: ERA5 at each retrieved level, at that level's tangent point.
-
-    Each level i gets the ERA5 column at (lat_lv[i], lon_lv[i]) - interpolated
-    horizontally, then vertically to h_m[i] (m above MSL; ERA5 geopotential
-    height z/g0 is also relative to MSL). Levels whose tangent point lies outside
-    the file's grid (or has no position) use the column above the station and are
-    flagged colocated=False. Time: the field nearest to `when`.
-    Returns arrays T (K), q (kg/kg), P (hPa), e (hPa), N, colocated, lat, lon.
+    .nc profile at each retrieved level (3.5.2): the column NEAREST to that level's
+    tangent point (levels without a position: the station), used only within
+    MAX_NC_DISTANCE_KM - farther levels get NaN. Works for gridded reanalysis and
+    for a single radiosonde file. Nearest time to `when`.
+    Returns T, q, P, e, N, colocated (= used), lat, lon, dist_km.
     """
-    try:
-        import xarray as xr
-    except ImportError:
-        return None
     h_m = np.asarray(h_m, float)
     n = len(h_m)
-    lat_lv = np.asarray(lat_lv if lat_lv is not None else np.full(n, np.nan), float)
-    lon_lv = np.asarray(lon_lv if lon_lv is not None else np.full(n, np.nan), float)
-    with xr.open_dataset(era5_file) as ds:
-        for dim in ('valid_time', 'time'):
-            if dim in ds.dims:
-                if when:
-                    ts = pd.Timestamp(when)
-                    if ts.tzinfo is not None:
-                        ts = ts.tz_convert('UTC').tz_localize(None)
-                    ds = ds.sel({dim: ts.to_datetime64()}, method='nearest')
-                else:
-                    ds = ds.mean(dim=dim)
-        la_g, lo_g = ds['latitude'].values, ds['longitude'].values
-        tol = 1e-6
-        inside = (np.isfinite(lat_lv) & np.isfinite(lon_lv)
-                  & (lat_lv >= la_g.min() - tol) & (lat_lv <= la_g.max() + tol)
-                  & (lon_lv >= lo_g.min() - tol) & (lon_lv <= lo_g.max() + tol))
-        la_use = np.clip(np.where(inside, lat_lv, sta_lat), la_g.min(), la_g.max())
-        lo_use = np.clip(np.where(inside, lon_lv, sta_lon), lo_g.min(), lo_g.max())
-        pts = ds[['t', 'q', 'z']].interp(latitude=xr.DataArray(la_use, dims='lv'),
-                                         longitude=xr.DataArray(lo_use, dims='lv'))
-        T = pts['t'].transpose('lv', 'pressure_level').values.astype(float)
-        Q = pts['q'].transpose('lv', 'pressure_level').values.astype(float)
-        Z = pts['z'].transpose('lv', 'pressure_level').values.astype(float) / 9.80665
-        Pl = ds['pressure_level'].values.astype(float)
-    out = {k: np.full(n, np.nan) for k in ('T', 'q', 'P')}
-    for i in range(n):
-        o = np.argsort(Z[i])
-        z, t, q, p = Z[i][o], T[i][o], Q[i][o], Pl[o]
-        if not np.isfinite(z).any():
-            continue
-        out['T'][i] = np.interp(h_m[i], z, t)
-        out['q'][i] = np.interp(h_m[i], z, q)
-        out['P'][i] = float(np.exp(np.interp(h_m[i], z, np.log(p))))
-    out['e'] = out['q'] * out['P'] / (0.622 + 0.378 * out['q'])
-    out['N'] = N_COEFF_A1 * out['P'] / out['T'] + N_COEFF_A2 * out['e'] / out['T'] ** 2
-    out['colocated'] = inside
-    out['lat'], out['lon'] = la_use, lo_use
-    return out
+    la = np.asarray(lat_lv if lat_lv is not None else np.full(n, np.nan), float)
+    lo = np.asarray(lon_lv if lon_lv is not None else np.full(n, np.nan), float)
+    la = np.where(np.isfinite(la), la, sta_lat)
+    lo = np.where(np.isfinite(lo), lo, sta_lon)
+    r = nc_at_points(era5_file, h_m, la, lo, when)
+    r['colocated'] = r['used']
+    return r
 
 
 def compare_with_era5(refractivity_csv: str, era5_file: str,
@@ -3747,10 +3971,12 @@ def compare_with_era5(refractivity_csv: str, era5_file: str,
         return ProcessingResult(False, None, "xarray required", {})
     ok = np.isfinite(e5['N'])
     if not ok.any():
-        return ProcessingResult(False, None, ".nc refractivity all-NaN at the retrieved levels", {})
+        return ProcessingResult(False, None, f"no .nc column within {MAX_NC_DISTANCE_KM:.0f} km of the tangent points "
+                                             f"(nearest {np.nanmin(e5['dist_km']):.0f} km)", {})
     comparison_df = pd.DataFrame({'height_km': ro_df['height_km'].values, 'N_RO': ro_df['refractivity_N'].values,
                                   'N_ERA5': e5['N'], 'error': ro_df['refractivity_N'].values - e5['N'],
-                                  'era5_colocated': e5['colocated'], 'era5_lat': e5['lat'], 'era5_lon': e5['lon']})
+                                  'era5_colocated': e5['colocated'], 'era5_lat': e5['lat'], 'era5_lon': e5['lon'],
+                                  'nc_dist_km': e5['dist_km']})
     for c in TP_COLUMNS:
         if c in ro_df.columns:
             comparison_df[c] = ro_df[c].values
@@ -3761,11 +3987,13 @@ def compare_with_era5(refractivity_csv: str, era5_file: str,
     below = (comparison_df['tp_distance_km'] > 1.0) if 'tp_distance_km' in comparison_df.columns \
         else np.ones(len(comparison_df), bool)                 # leave out the station row itself
     n_co = int((comparison_df['era5_colocated'] & below).sum())
-    where = (f"at the tangent points ({n_co}/{int(below.sum())} levels below the station)" if n_co
-             else "above the station only - the .nc file does not cover the tangent points")
+    dk = comparison_df.loc[below, 'nc_dist_km']
+    src = 'radiosonde/profile' if e5.get('kind') == 'profile' else 'grid'
+    where = (f"{n_co}/{len(ro_df) - 1} levels with a {src} column ≤ {MAX_NC_DISTANCE_KM:.0f} km "
+             f"(nearest {dk.min():.0f}–{dk.max():.0f} km)" if len(dk) else "station level only")
     return ProcessingResult(
         success=True, data=comparison_df,
-        message=f".nc comparison {where}: RMSE={np.sqrt(np.mean(err ** 2)):.2f}, bias={err.mean():+.2f} N",
+        message=f".nc comparison, {where}: RMSE={np.sqrt(np.mean(err ** 2)):.2f}, bias={err.mean():+.2f} N",
         metadata={'rmse': float(np.sqrt(np.mean(err ** 2))), 'bias': float(err.mean()),
                   'n_colocated': n_co, 'n_levels': len(comparison_df)})
 
@@ -3805,7 +4033,16 @@ def retrieve_atmospheric_profile(refractivity_csv: str, era5_file: str,
     except Exception as e:
         return ProcessingResult(False, None, f".nc extraction failed: {e}", {})
     if e5 is None or not np.isfinite(e5['T']).any():
-        return ProcessingResult(False, None, ".nc temperature unavailable", {})
+        return ProcessingResult(False, None, f".nc temperature unavailable (no column within "
+                                             f"{MAX_NC_DISTANCE_KM:.0f} km)", {})
+    keep_t = np.isfinite(e5['T'])
+    if keep_t.sum() < 2:
+        return ProcessingResult(False, None, "fewer than 2 levels with .nc temperature in range", {})
+    if not keep_t.all():                          # 3.5.2: levels without a .nc column in range are left out
+        ro_df = ro_df[keep_t].reset_index(drop=True)
+        tp_extra = {c: v[keep_t] for c, v in tp_extra.items()}
+        h_m, N = h_m[keep_t], N[keep_t]
+        e5 = {k: (v[keep_t] if isinstance(v, np.ndarray) and v.shape == keep_t.shape else v) for k, v in e5.items()}
     T, P_era5, q_era5 = e5['T'], e5['P'], e5['q']
 
     n = len(h_m)
@@ -3860,9 +4097,8 @@ def retrieve_atmospheric_profile(refractivity_csv: str, era5_file: str,
         profile.to_csv(output_csv, index=False)
     below = (np.asarray(tp_extra['tp_distance_km']) > 1.0) if 'tp_distance_km' in tp_extra else np.ones(n, bool)
     n_co = int(np.sum(e5['colocated'] & below))
-    msg = (f"Atmospheric retrieval OK (P boundary={P_src}; .nc "
-           + (f"at the tangent points for {n_co}/{int(below.sum())} levels)" if n_co
-              else "above the station only - the .nc file does not cover the tangent points)"))
+    msg = (f"Atmospheric retrieval OK (P boundary={P_src}; .nc T for {n_co}/{int(below.sum())} levels, "
+           f"nearest column ≤ {MAX_NC_DISTANCE_KM:.0f} km)")
     if n_capped:
         msg += f"; {n_capped} levels capped at saturation"
     return ProcessingResult(
@@ -4520,7 +4756,7 @@ CHECK_SHORT = {'Atmospheric Doppler (reference satellite found)': 'Atmos. Dopple
                'Below the horizon (0°)': 'Below 0°', 'Epochs in this occultation': 'Event epochs',
                'Ray geometry solved': 'Geometry', 'Bending > 0 (no Doppler bias)': 'Bending > 0',
                'Crosses the apparent horizon': 'Crosses horizon', 'Below/above rays overlap': 'Overlap',
-               'Profile levels': 'Levels', "Partial bending physical (model alpha_P)": "Physical α′ (model α_P)"}
+               'Profile levels': 'Levels', 'Bending grows with depth (QC)': 'Depth QC', "Partial bending physical (model alpha_P)": "Physical α′ (model α_P)"}
 CHECK_COLOR = {True: '#1a8a4a', False: '#c62828', None: '#e07b00', 'not_reached': '#a8a7a2'}
 
 
@@ -4698,20 +4934,22 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
     y_next = 0.928
     if tag:                                            # v4.6: single-frequency alert banner
         sig1 = str(bend['sig1'].iloc[0]) if 'sig1' in bend.columns else get_freq_labels_from_sat_id(sat_id)[0]
-        fig.text(0.015, y_next, f"  ⚠  SINGLE-FREQUENCY occultation ({sig1} only): the second frequency was not "
-                                f"available, so there is NO ionospheric correction (about 1–2 % in N).  ",
+        n_nc = int((~bend['iono_corrected'].astype(bool)).sum()) if 'iono_corrected' in bend.columns else 0
+        fig.text(0.015, y_next, f"  ⚠  SINGLE-FREQUENCY occultation ({sig1} only): ionosphere cancelled in "
+                                f"αN − αP (L1 − L1)" + (f"; NOT cancelled on {n_nc} model-αP level(s) (hollow)"
+                                                        if n_nc else " on every level") + ".  ",
                  fontsize=10.5, color='#7a2e00', fontweight='bold', va='center', ha='left',
                  bbox=dict(boxstyle='round,pad=0.45', facecolor='#ffe3cc', edgecolor='#e07b00', linewidth=1.2))
         y_next -= 0.035
     # v4.7: per-level flags - L1-only (L2 gap) and model alpha_P (no above-horizon ray)
-    flag_l1 = (~bend['iono_corrected'].astype(bool)).values if (not tag and 'iono_corrected' in bend.columns) \
-        else np.zeros(len(bend), bool)
+    flag_l1 = (~bend['iono_corrected'].astype(bool)).values if 'iono_corrected' in bend.columns \
+        else np.zeros(len(bend), bool)                 # 3.5.2: hollow = ionosphere not cancelled
     flag_mod = (bend['alpha_P_src'] == 'model').values if 'alpha_P_src' in bend.columns else np.zeros(len(bend), bool)
     flagged = flag_l1 | flag_mod
     # Flagged levels (3.5.1): hollow marker = L1-only level (L2 gap, no ionospheric
     # correction). The marker explains itself; the legend names it once.
     from matplotlib.lines import Line2D
-    FLAG_TXT_L1 = 'L1-only (L2 gap)'
+    FLAG_TXT_L1 = 'iono not cancelled'
 
     def _flag_on(mask, h):
         """per-level flag for rows of another table (refractivity/comparison), matched by height."""
@@ -4726,7 +4964,7 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
         x, y = np.asarray(x, float), np.asarray(y, float)
         f1 = np.zeros(len(x), bool) if fl_l1 is None else np.asarray(fl_l1, bool)
         fm = np.zeros(len(x), bool) if fl_mod is None else np.asarray(fl_mod, bool)
-        f1 = f1 & ~fm
+        fm = fm & ~f1                                   # L1-only wins: hollow
         ax_.scatter(x[~(f1 | fm)], y[~(f1 | fm)], **mk, label=label)
         col = mk.get('color', mk.get('edgecolors'))
         ms = float(np.sqrt(mk.get('s', 34)))
@@ -4734,9 +4972,9 @@ def generate_derived_plots(sat_results: Dict[str, Any], sat_id: str, output_path
                      markeredgewidth=1.3, zorder=3)
         if f1.any():
             ax_.plot(x[f1], y[f1], markerfacecolor='white', **style)
-        if fm.any():                                    # model alpha_P levels (feature off in 3.5.1)
-            ax_.plot(x[fm], y[fm], markerfacecolor='white', **style)
-        ax_._flags = getattr(ax_, '_flags', set()) | ({'l1'} if f1.any() else set()) | ({'mod'} if fm.any() else set())
+        if fm.any():                                    # model alpha_P levels: drawn like normal levels
+            ax_.scatter(x[fm], y[fm], **mk)
+        ax_._flags = getattr(ax_, '_flags', set()) | ({'l1'} if f1.any() else set())
 
     def _legend(ax_, **kw):
         """legend + one neutral entry per flag type present in this plot."""

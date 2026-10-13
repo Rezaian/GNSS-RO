@@ -1304,6 +1304,8 @@ class ProcessingPanel(QGroupBox):
         ('RO_MIN_EPOCHS',               'RO min epochs',             'int',   1,     100000,  1,    "Minimum low-elevation epochs for an RO candidate."),
         ('RO_MIN_NEG_ELEV_EPOCHS',      'RO min epochs below 0°',    'int',   0,     100000,  1,    "Minimum epochs at negative geometric elevation."),
         ('EVENT_GAP_S',                 'Event gap (s)',             'float', 1.0,   86400.0, 1,    "A gap longer than this splits a satellite into separate occultation events."),
+        ('MAX_NC_DISTANCE_KM',          'Max .nc distance (km)',     'float', 1.0,   5000.0,  0,    "A .nc column is used only within this distance of the tangent point (or station):\nthe nearest grid point of a gridded file (e.g. ERA5), or a single radiosonde profile."),
+        ('ALPHA_P_MODEL',               'Model α_P if not measured', 'apmodel', None, None,   None, "Satellites that stay below the apparent horizon (no above-horizon ray) and levels whose\nabove-horizon ray was not tracked get alpha_P from a model atmosphere (.nc file if available).\nOff = such levels/satellites are dropped.\n(.cra value 'always' = use the model for every level.)"),
         ('ALLOW_SINGLE_FREQ',           'Allow single-frequency',    'bool',  None,  None,    None, "Use L1-only events when dual-frequency data is missing.\nNO ionospheric correction (~1–2% in N). Results are flagged ◐ [RO·1F] in amber."),
         ('REF_SAT_ELEVATION_THRESHOLD', 'Ref-sat elev thresh (°)',   'float', 0.0,   90.0,    1,    "Reference satellites must stay above this elevation; epochs without one are dropped."),
         ('REF_SAT_MIN_EPOCHS',          'Ref-sat min epochs',        'int',   1,     100000,  1,    "Minimum coverage for the primary reference satellite."),
