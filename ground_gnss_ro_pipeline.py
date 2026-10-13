@@ -2060,7 +2060,7 @@ class SP3Parser:
 
     def _parse(self, filename: str) -> None:
         """Parse SP3 file. Note: SP3 timestamps are natively GPS Time."""
-        with open(filename, 'r') as f:
+        with open(filename, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
         
         current_epoch = None
@@ -3266,7 +3266,7 @@ class BendingAngleRetriever:
                 for item in (evs or [sid]):
                     items[item] = {'sat_id': sid, 'candidate': v['candidate'], 'freq_mode': v['freq_mode'],
                                    'checks': v['checks'] + c5.get(item, [])}
-            with open(f"{output_dir}/ro_checks.json", 'w') as f:
+            with open(f"{output_dir}/ro_checks.json", 'w', encoding='utf-8') as f:
                 json.dump(items, f, indent=1, default=str)
 
         if not ro_sats:
@@ -4301,7 +4301,7 @@ def generate_session_report(ground_dir: str, pdf_path: str, status: Dict[str, An
     q = {}
     if os.path.exists(qfile):
         try:
-            q = json.load(open(qfile))
+            q = json.load(open(qfile, encoding='utf-8', errors='replace'))
         except Exception:
             q = {}
     elif os.path.exists(step4):
@@ -4785,7 +4785,7 @@ CHECK_COLOR = {True: '#1a8a4a', False: '#c62828', None: '#e07b00', 'not_reached'
 def load_ro_checks(bending_dir: str, item_id: str) -> Optional[Dict[str, Any]]:
     """The RO tests written by step 5 (bending/ro_checks.json) for one list item."""
     try:
-        with open(os.path.join(bending_dir, 'ro_checks.json')) as f:
+        with open(os.path.join(bending_dir, 'ro_checks.json'), encoding='utf-8', errors='replace') as f:
             data = json.load(f)
     except Exception:
         return None

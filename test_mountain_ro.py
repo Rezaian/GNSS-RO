@@ -18,6 +18,12 @@ Pass criteria (fixed before running):
 """
 import os
 import sys
+import sys as _sys
+for _s in (_sys.stdout, _sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import tempfile
 import numpy as np
 import pandas as pd

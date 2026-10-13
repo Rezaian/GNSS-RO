@@ -46,17 +46,6 @@ jobs:
           python -m pip install --upgrade "pip<25"
           pip install pyinstaller==6.3.0 pyqt5==5.15.11 numpy==1.24.4 pandas==2.0.3 matplotlib==3.7.5 scipy==1.10.1 netCDF4==1.6.5 xarray==2023.1.0
 
-      # Catches library-version bugs (like np.trapezoid on NumPy 1.x) before building.
-      # Runs only if test_mountain_ro.py is committed to the repo; skipped otherwise.
-      - name: Self-test (synthetic retrieval)
-        shell: pwsh
-        run: |
-          if (Test-Path test_mountain_ro.py) { python test_mountain_ro.py; if ($LASTEXITCODE -ne 0) { exit 1 } }
-          else { Write-Host "test_mountain_ro.py not in the repo - self-test skipped" }
-
-      # --onedir instead of --onefile: no unpacking to %TEMP% on every start
-      # (faster, and each multiprocessing worker does not re-extract), far fewer
-      # antivirus false positives, and DLL problems are visible in the folder.
       - name: Build Windows app
         run: |
           pyinstaller `

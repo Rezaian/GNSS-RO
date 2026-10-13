@@ -15,6 +15,11 @@ Features:
 
 import sys
 import os
+for _s in (sys.stdout, sys.stderr):   # Windows cp1252 consoles: never crash on unicode
+    try:
+        _s.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 __version__ = "3.5.5"
 import re
@@ -100,7 +105,7 @@ PREFS_FILE = os.path.join(os.path.expanduser('~'), '.gnss_ro_gui.json')
 
 def _load_prefs() -> Dict[str, Any]:
     try:
-        with open(PREFS_FILE) as f:
+        with open(PREFS_FILE, encoding='utf-8', errors='replace') as f:
             p = json.load(f)
         return p if isinstance(p, dict) else {}
     except Exception:
@@ -113,7 +118,7 @@ def _remember_dir(directory: str):
     p['recent'] = [directory] + rec[:7]
     p['last_dir'] = directory
     try:
-        with open(PREFS_FILE, 'w') as f:
+        with open(PREFS_FILE, 'w', encoding='utf-8') as f:
             json.dump(p, f, indent=1)
     except OSError:
         pass
@@ -350,7 +355,7 @@ def load_metadata(filepath: str) -> Optional[Dict]:
 def save_metadata(filepath: str, data: Dict) -> bool:
     """Write a metadata dict to .cra. Used when no prior file exists."""
     try:
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4)
         return True
     except Exception:
@@ -380,7 +385,7 @@ def merge_save_metadata(filepath: str, station_fields: Dict,
     existing = {}
     if os.path.exists(filepath):
         try:
-            with open(filepath, 'r') as f:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
                 existing = json.load(f) or {}
         except Exception:
             existing = {}
@@ -404,7 +409,7 @@ def merge_save_metadata(filepath: str, station_fields: Dict,
         existing['PROCESSING'] = proc
 
     try:
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(existing, f, indent=4)
         return True
     except Exception:
@@ -754,7 +759,7 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
 
     def write_log():
         try:
-            with open(os.path.join(output_dir, 'log.txt'), 'w') as f:
+            with open(os.path.join(output_dir, 'log.txt'), 'w', encoding='utf-8') as f:
                 f.write('\n'.join(log_lines))
         except OSError:
             pass
@@ -838,7 +843,7 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
         # 3.5.2: data-collection quality of the session (GUI card + report)
         try:
             q = session_quality(df_plot)
-            with open(os.path.join(output_dir, 'session_quality.json'), 'w') as f:
+            with open(os.path.join(output_dir, 'session_quality.json'), 'w', encoding='utf-8') as f:
                 json.dump(q, f, indent=1, default=lambda o: float(o) if hasattr(o, '__float__') else str(o))
         except Exception as e:
             log(f"session quality not written: {e}")
@@ -914,7 +919,7 @@ def run_satellite_pipeline(conphs_dir: str, output_dir: str, progress_queue: Que
     def write_log():
         log_path = os.path.join(output_dir, 'log.txt')
         try:
-            with open(log_path, 'w') as f:
+            with open(log_path, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(log_lines))
         except:
             pass
@@ -2540,7 +2545,7 @@ class MainWindow(QMainWindow):
             qf = os.path.join(self.ground_output_dir or '', 'session_quality.json')
             try:
                 if os.path.exists(qf):
-                    q = json.load(open(qf))
+                    q = json.load(open(qf, encoding='utf-8', errors='replace'))
                 else:
                     s4 = os.path.join(self.ground_output_dir or '', 'step4_differenced.csv')
                     if os.path.exists(s4):
