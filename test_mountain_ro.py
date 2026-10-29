@@ -57,8 +57,10 @@ def truth_profile():
 
 
 def main(noise_hz=0.0, n_events=1, check_step7=True, label='', single_freq=False, allow_single=False, seed=7,
-         below_only=False):
-    """below_only: the satellite never rises above the apparent horizon -> alpha_P from the model."""
+         below_only=False, drop=None, single_sig='L1C/A'):
+    """below_only: the satellite never rises above the apparent horizon -> alpha_P from the model.
+    drop: signal lost on the deeper part of the below-horizon branch (3.5.6 per-epoch fallback).
+    single_sig: the one signal recorded when single_freq."""
     gp.ALLOW_SINGLE_FREQ = allow_single
     gp.ALPHA_P_MODEL = 'fill'
     rng = np.random.default_rng(seed)
@@ -123,7 +125,10 @@ def main(noise_hz=0.0, n_events=1, check_step7=True, label='', single_freq=False
             el, _ = gp.elevation_azimuth(tx3, st_xyz, LAT, LON)
             utc = (t0 + pd.Timedelta(seconds=k_ep)).strftime('%Y-%m-%dT%H:%M:%S.%f')
             tbranch[utc] = (branch, a)
-            for sig, f in ((('L1C/A', F1),) if single_freq else (('L1C/A', F1), ('L2CL', F2))):
+            for sig, f in (((single_sig, F1 if single_sig == 'L1C/A' else F2),) if single_freq
+                           else (('L1C/A', F1), ('L2CL', F2))):
+                if drop == sig and branch == -1 and a < a_vals[len(a_vals) * 3 // 5]:
+                    continue                                  # lost lock below the horizon
                 dop = float(v2 @ (k_t - k0)) * f / gp.SPEED_OF_LIGHT + rng.normal(0, noise_hz) * (noise_hz > 0)
                 # SP3 gives the position at RECEIVE time; the signal left tau earlier (at tx3)
                 rx3 = tx3 + v3 * (np.linalg.norm(tx3 - st_xyz) / gp.SPEED_OF_LIGHT)
@@ -185,6 +190,16 @@ def main(noise_hz=0.0, n_events=1, check_step7=True, label='', single_freq=False
             crit = "alpha_P all from the model, rms dN<2"
             nstat = (f"rms dN {np.sqrt(np.mean(err_N ** 2)):.2f}, max |dN| {np.max(np.abs(err_N)):.2f}, "
                      f"alpha_P source {sorted(src)}")
+        elif drop:
+            meth = set(b['iono_method'])
+            other = 'L2' if drop == 'L1C/A' else 'L1'
+            meas = b['alpha_P_src'].values == 'measured'
+            err_alpha = err_alpha[meas]                       # the top edge level may be model-filled, as in the clean run
+            a_ok = (meas.mean() > 0.95 and f'{other} difference' in meth
+                    and np.nanmax(np.abs(err_alpha)) < 1e-6)
+            n_ok = np.max(np.abs(err_N)) < 0.5
+            crit = f"alpha_P measured (>95%), {other}-only levels used, max|dalpha|<1e-6, max|dN|<0.5"
+            nstat = f"max |dN| {np.max(np.abs(err_N)):.3f}, methods {sorted(meth)}"
         elif noise_hz == 0:
             # exact geometry applies to measured-alpha_P levels; model-filled edge levels
             # (v4.7) are tested by the below-horizon-only scenario
@@ -206,7 +221,7 @@ def main(noise_hz=0.0, n_events=1, check_step7=True, label='', single_freq=False
     rcsv = os.path.join(tmp, f'refr_{ids[0]}.csv') if ids else None
 
     # ---- tangent-point geometry vs an independent numerical ray trace (clean run only)
-    if ids and noise_hz == 0 and not single_freq and not below_only:
+    if ids and noise_hz == 0 and not single_freq and not below_only and not drop:
         rf0 = pd.read_csv(rcsv)
         lv = rf0[(rf0['height_km'] < (H_STA - 300.0) / 1e3)].iloc[::max(1, len(rf0) // 6)]
         dn_dr = np.gradient(n, r)
@@ -316,6 +331,10 @@ if __name__ == '__main__':
         'single-freq, mode on':     main(single_freq=True, allow_single=True, check_step7=False, label='single frequency, mode ON'),
         'single-freq, mode off':    main(single_freq=True, allow_single=False, check_step7=False, label='single frequency, mode OFF'),
         'below horizon only (model alpha_P)': main(below_only=True, check_step7=False, label='below the horizon only'),
+        'L1 lost below horizon':    main(drop='L1C/A', allow_single=True, check_step7=False, label='L1 lost below the horizon'),
+        'L2 lost below horizon':    main(drop='L2CL', allow_single=True, check_step7=False, label='L2 lost below the horizon'),
+        'single-freq L2 only':      main(single_freq=True, allow_single=True, single_sig='L2CL', check_step7=False,
+                                         label='single frequency, L2 only'),
     }
     print("\n" + "\n".join(f"{'PASS' if v else 'FAIL'}  {k}" for k, v in results.items()))
     sys.exit(0 if all(results.values()) else 1)

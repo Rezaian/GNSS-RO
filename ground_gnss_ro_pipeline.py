@@ -45,6 +45,7 @@ import struct
 import glob
 import math
 import json
+import re
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -72,10 +73,11 @@ def _to_datetime(values, **kw):
         return pd.to_datetime(values, format='mixed', **kw)
     return pd.to_datetime(values, **kw)
 
-__version__ = "3.5.5"
+__version__ = "3.5.6"
 
-# 3.5.5: RO status checklist (Panel 2 "RO tests" strip and the checklist pages for
-# items without a profile) temporarily disabled. ro_checks.json is still written.
+# RO status checklist (Panel 2 "RO tests" strip and the checklist pages for items
+# without a profile). 3.5.6: user setting SHOW_RO_CHECKS (.cra / Advanced Settings),
+# off by default. ro_checks.json is always written.
 SHOW_RO_CHECKS = False
 
 warnings.filterwarnings('ignore')
@@ -254,6 +256,9 @@ POLY_MIN_WINDOW = 10.0           # s: minimum smoothing window
 POLYFIT_GAP_THRESHOLD = 5.0
 
 # Mountain-top bending / inversion
+HORIZON_CALIBRATION = True       # 3.5.6: remove a Doppler offset that puts the impact-parameter peak above n_r r_r
+SPIKE_MIN_HZ = 0.5               # 3.5.6: atmos Doppler further than this (and 6 sigma) from the running median is a spike
+IONO_DIFF_MAX_RAD = 1.0e-3      # 3.5.6: |alpha_L1 - alpha_L2| above this is a tracking error, not ionosphere
 A_BIN_M = 20.0                   # m: impact-parameter bin for averaging bending
 IONO_SMOOTH_BINS = 9             # bins: smoothing of the L1-L2 bending difference (Hajj Eq. 18)
 BRANCH_SMOOTH = 15               # epochs: median filter on a(t) before locating the apparent horizon
@@ -311,7 +316,9 @@ PROCESSING_DEFAULTS = {
     'MAX_NC_DISTANCE_KM': 250.0,      # Use a .nc column (nearest grid point, or a single radiosonde) only within this distance of the tangent point / station (km).
     'ALPHA_P_MODEL': 'fill',          # alpha_P from a model atmosphere (.nc column or standard) where no above-horizon ray: 'off' | 'fill' | 'always'.
     'ALPHA_P_WET_H_M': 2000.0,        # Water-vapour scale height of the model atmosphere when no .nc file (m).
-    'ALLOW_SINGLE_FREQ': True,        # Single-frequency events when dual is missing (no ionospheric correction; flagged).
+    'ALLOW_SINGLE_FREQ': True,        # Use one frequency (L1 or L2) wherever the other is missing (no ionospheric correction there; flagged).
+    'HORIZON_CALIBRATION': True,      # Remove a constant Doppler offset when the impact parameter peaks above n_r r_r (physically impossible).
+    'SHOW_RO_CHECKS': False,          # Panel 2: RO test checklist (strip, and a page for satellites without a profile).
     'SMOOTH_ELEV_MAX_DEG': 90.0,       # Smooth atmos Doppler below this elevation (90 = all; lower = faster).
 
     # Reference satellite selection (kept for forward compatibility w/ ref-rework)
@@ -364,7 +371,7 @@ def apply_processing_config(cfg: Dict) -> None:
     global FORCE_CRA_STATION_COORDS
     global REF_MODE, STATION_SPLIT_WARN_M
     global ALPHA_P_MODEL, ALPHA_P_WET_H_M, DERIVED_DOPPLER_OUT_S, MAX_NC_DISTANCE_KM
-    global SMOOTH_ELEV_MAX_DEG, ALLOW_SINGLE_FREQ, BRANCH_GUARD_DEG, BRANCH_AMBIGUOUS_DEG
+    global SMOOTH_ELEV_MAX_DEG, ALLOW_SINGLE_FREQ, BRANCH_GUARD_DEG, BRANCH_AMBIGUOUS_DEG, SHOW_RO_CHECKS, HORIZON_CALIBRATION
     global REF_SAT_ELEVATION_THRESHOLD, REF_SAT_MIN_EPOCHS, REF_SAT_JUMP_THRESHOLD
     global EVENT_GAP_S, STATION_MISMATCH_WARN_M, UBX_POS_MAX_HACC_M, UBX_POS_MAX_VACC_M, UBX_POS_MIN_FIXES
 
@@ -389,6 +396,8 @@ def apply_processing_config(cfg: Dict) -> None:
     EVENT_GAP_S            = float(cfg.get('EVENT_GAP_S', EVENT_GAP_S))
     SMOOTH_ELEV_MAX_DEG    = float(cfg.get('SMOOTH_ELEV_MAX_DEG', SMOOTH_ELEV_MAX_DEG))
     ALLOW_SINGLE_FREQ      = bool(cfg.get('ALLOW_SINGLE_FREQ', ALLOW_SINGLE_FREQ))
+    SHOW_RO_CHECKS         = bool(cfg.get('SHOW_RO_CHECKS', SHOW_RO_CHECKS))
+    HORIZON_CALIBRATION    = bool(cfg.get('HORIZON_CALIBRATION', HORIZON_CALIBRATION))
     ALPHA_P_MODEL          = str(cfg.get('ALPHA_P_MODEL', ALPHA_P_MODEL)).lower()
     if ALPHA_P_MODEL in ('true', '1', 'yes'): ALPHA_P_MODEL = 'fill'
     if ALPHA_P_MODEL in ('false', '0', 'no', 'none'): ALPHA_P_MODEL = 'off'
@@ -812,30 +821,37 @@ def ro_selection_checks(sat_data: pd.DataFrame,
                        'value': f'{int(round(n_neg))} epochs', 'need': f'≥ {RO_MIN_NEG_ELEV_EPOCHS} epochs'})
         # (original test 3) dual frequency, or the single-frequency fallback
         gnss_id = group['gnssId'].iloc[0] if 'gnssId' in group.columns else None
-        single_ok, n_single = False, 0
+        single_ok, n_single, single_sig = False, 0, None
         if gnss_id in SINGLE_FREQ_SIGNALS and t_col in low.columns:
-            n_single = low.loc[low['sigID'] == SINGLE_FREQ_SIGNALS[gnss_id], t_col].nunique()
-            single_ok = ALLOW_SINGLE_FREQ and n_single >= min_epochs
-        dual_count = 0
+            single_sig = SINGLE_FREQ_SIGNALS[gnss_id]
+            n_single = low.loc[low['sigID'] == single_sig, t_col].nunique()
+        dual_count, n_any = 0, 0
         if gnss_id in FREQ_PAIRS and t_col in low.columns:
             s1, s2 = FREQ_PAIRS[gnss_id]
-            dual_count = len(set(low.loc[low['sigID'] == s1, t_col]) & set(low.loc[low['sigID'] == s2, t_col]))
+            e1, e2 = set(low.loc[low['sigID'] == s1, t_col]), set(low.loc[low['sigID'] == s2, t_col])
+            dual_count, n_any = len(e1 & e2), len(e1 | e2)
+            # 3.5.6: single frequency on whichever signal of the pair was tracked (L1 or L2)
+            single_sig, n_single = (s1, len(e1)) if len(e1) >= len(e2) else (s2, len(e2))
             pair_txt = f'{s1} + {s2}'
         else:
             pair_txt = 'no pair defined'
+        single_ok = ALLOW_SINGLE_FREQ and n_single >= min_epochs
         dual_ok = dual_count >= min_dual_freq_epochs
         if dual_ok:
+            extra = n_any - dual_count
             checks.append({'name': f'Dual frequency ({pair_txt})', 'passed': True,
-                           'value': f'{dual_count} common epochs', 'need': f'≥ {min_dual_freq_epochs}'})
+                           'value': f'{dual_count} common epochs'
+                                    + (f' (+{extra} with one frequency)' if extra and ALLOW_SINGLE_FREQ else ''),
+                           'need': f'≥ {min_dual_freq_epochs}'})
         elif single_ok:
             checks.append({'name': f'Dual frequency ({pair_txt})', 'passed': None,
                            'value': f'only {dual_count} common epochs - SINGLE-FREQUENCY used '
-                                    f'({SINGLE_FREQ_SIGNALS[gnss_id]}, {n_single} epochs, no iono correction)',
+                                    f'({single_sig}, {n_single} epochs, no iono correction)',
                            'need': f'≥ {min_dual_freq_epochs}'})
         else:
             checks.append({'name': f'Dual frequency ({pair_txt})', 'passed': False,
                            'value': f'{dual_count} common epochs'
-                                    + ('' if ALLOW_SINGLE_FREQ else f' (single-frequency mode off; {n_single} L1 epochs)'),
+                                    + ('' if ALLOW_SINGLE_FREQ else f' (single-frequency mode off; {n_single} {single_sig} epochs)'),
                            'need': f'≥ {min_dual_freq_epochs}'})
         candidate = (ro_count >= min_epochs) and (n_neg >= RO_MIN_NEG_ELEV_EPOCHS) and (dual_ok or single_ok)
         out[sat_id] = {'candidate': bool(candidate), 'freq_mode': 'dual' if dual_ok else ('single' if single_ok else None),
@@ -2864,20 +2880,31 @@ def apply_fresnel_polynomial_smoothing(df: pd.DataFrame, fresnel_window_sec: Opt
             win = np.full(len(t), float(fixed_window))
         seg = np.concatenate([[0], np.cumsum(np.diff(t) >= gap_threshold)])
         fin = np.isfinite(v)
+        fin_v = fin.copy()                     # evaluate at every epoch with a value
+        # 3.5.6: spikes (cycle slips / tracking jumps, tens to hundreds of Hz) are left
+        # out of the fits; one spike in a 60 s window used to pull the whole fit by Hz.
+        if fin.sum() >= 11:
+            vs = pd.Series(np.where(fin, v, np.nan))
+            med = vs.rolling(31, center=True, min_periods=5).median().values
+            res = v - med
+            sig = 1.4826 * np.nanmedian(np.abs(res[np.isfinite(res)])) if np.isfinite(res).any() else np.nan
+            if np.isfinite(sig):
+                spike = np.isfinite(res) & (np.abs(res) > max(SPIKE_MIN_HZ, 6.0 * sig))
+                fin = fin & ~spike
         out = np.full(len(t), np.nan)
-        for k in np.where(fin & (el < el_lim))[0]:
+        for k in np.where(fin_v & (el < el_lim))[0]:
             lo = np.searchsorted(t, t[k] - win[k] / 2.0, side='left')
             hi = np.searchsorted(t, t[k] + win[k] / 2.0, side='right')
             m = np.arange(lo, hi)
             m = m[(seg[m] == seg[k]) & fin[m]]
             if len(m) < 2:
-                out[k] = v[k]
+                out[k] = v[k] if fin[k] else np.nan
                 continue
             order = 2 if len(m) >= 5 else 1
             try:
                 out[k] = np.polyval(np.polyfit(t[m] - t[k], v[m], order), 0.0)
             except (np.linalg.LinAlgError, ValueError):
-                out[k] = v[k]
+                out[k] = v[k] if fin[k] else np.nan
         ix = pos.loc[group.index].values
         out_all[ix] = out
         win_all[ix] = win
@@ -2978,6 +3005,90 @@ def bending_geometry(f_atm: float, lam: float, r_t: np.ndarray, v_t: np.ndarray,
     return float(dt), float(a), float(np.arctan2(s_r, d)), float(np.arccos(c))
 
 
+def geometry_vec(f_atm, lam, r_t, v_t, r_r, n_r, min_vp=None):
+    """
+    3.5.6: bending_geometry() for all epochs at once (same equations).
+    Returns dict of arrays: dt, a, phi, c, vp, vk, d, s_t, ok (0 < c <= 1, |vp| >= MIN_VP).
+    """
+    if min_vp is None:
+        min_vp = MIN_VP
+    f_atm = np.asarray(f_atm, float)
+    L = r_r[None, :] - r_t
+    k0 = L / np.linalg.norm(L, axis=1)[:, None]
+    s_t = np.einsum('ij,ij->i', r_t, k0)
+    p = r_t - s_t[:, None] * k0
+    d = np.linalg.norm(p, axis=1)
+    ph = p / d[:, None]
+    vk = np.einsum('ij,ij->i', v_t, k0)
+    vp = np.einsum('ij,ij->i', v_t, ph)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        rhs = f_atm * lam
+        dt = rhs / vp
+        for _ in range(5):
+            g = vk * (np.cos(dt) - 1.0) + vp * np.sin(dt) - rhs
+            dt = dt - g / (vp * np.cos(dt) - vk * np.sin(dt))
+        a = d * np.cos(dt) - s_t * np.sin(dt)
+        s_r = k0 @ r_r
+        c = a / (n_r * np.hypot(s_r, d))
+        phi = np.arctan2(s_r, d)
+    ok = np.isfinite(f_atm) & (np.abs(vp) >= min_vp) & (c > 0.0) & (c <= 1.0)
+    return dict(dt=dt, a=a, phi=phi, c=c, vp=vp, vk=vk, d=d, s_t=s_t, ok=ok)
+
+
+def horizon_calibrated_geometry(f_atm, lam, r_t, v_t, r_r, n_r, t):
+    """
+    3.5.6: Bouguer's rule at the receiver gives a = n_r r_r sin(z) <= n_r r_r, with
+    equality for the apparent-horizon ray. If the smoothed impact parameter a(t)
+    PEAKS INSIDE the track above n_r r_r, no ray can explain the Doppler: a constant
+    Doppler offset (residual ionosphere, reference or orbit error) is present. It is
+    removed by shifting the Doppler so that the peak equals n_r r_r. A constant
+    offset is common to alpha_N and alpha_P, so the partial bending is unchanged to
+    first order; without the shift the rays below the horizon cannot be solved at all.
+    Only applied when the peak is inside the data (both sides present) and too high.
+    Returns (G (n x 4: dt, a, phi, acos c), info dict or None).
+    """
+    f = np.asarray(f_atm, float).copy()
+    x_r = n_r * float(np.linalg.norm(r_r))
+    info = None
+    if HORIZON_CALIBRATION:
+        valid = np.isfinite(f)
+        g = geometry_vec(f, lam, r_t, v_t, r_r, n_r)
+        valid &= np.abs(g['vp']) >= MIN_VP
+        idx = np.where(valid)[0]
+        if len(idx) >= 30:
+            dt0 = float(np.median(np.diff(t[idx]))) if len(idx) > 1 else 1.0
+            w = int(max(15, round(5.0 / max(dt0, 1e-3))))
+            total = 0.0
+            for _ in range(3):
+                sm = pd.Series(g['a'][idx]).rolling(w, center=True, min_periods=max(3, w // 3)).median().values
+                if not np.isfinite(sm).any():
+                    break
+                ipk = int(np.nanargmax(sm))
+                excess = float(sm[ipk] - x_r)
+                n_before, n_after = ipk, len(idx) - 1 - ipk
+                if excess <= 0.5 or n_before < w or n_after < w:
+                    break
+                j = idx[max(0, ipk - w // 2): ipk + w // 2 + 1]
+                ddt_df = lam / (g['vp'][j] * np.cos(g['dt'][j]) - g['vk'][j] * np.sin(g['dt'][j]))
+                da_ddt = -g['d'][j] * np.sin(g['dt'][j]) - g['s_t'][j] * np.cos(g['dt'][j])
+                slope = float(np.nanmedian(da_ddt * ddt_df))
+                if not np.isfinite(slope) or slope == 0:
+                    break
+                df_ = -excess / slope
+                f = f + df_
+                total += df_
+                if info is None:
+                    info = {'excess_m': excess}
+                g = geometry_vec(f, lam, r_t, v_t, r_r, n_r)
+            if info is not None:
+                info['offset_hz'] = total
+    g = geometry_vec(f, lam, r_t, v_t, r_r, n_r)
+    G = np.full((len(f), 4), np.nan)
+    ok = g['ok']
+    G[ok] = np.column_stack([g['dt'][ok], g['a'][ok], g['phi'][ok], np.arccos(g['c'][ok])])
+    return G, info
+
+
 def apparent_horizon_prior_deg(n_r: float, r_r: float, scale_height_m: float = 7500.0) -> float:
     """
     Geometric elevation of the apparent horizon (the ray arriving horizontally),
@@ -3059,6 +3170,25 @@ def label_branches(a: np.ndarray, elevation: np.ndarray,
     return br.astype(int), k
 
 
+_SIGNAL_COL = re.compile(r'dopp|cno|cn0|snr|carrier|freq|sigid|pseudo|phase|range|lock|slip|halfcyc|^pr|^cp|^do',
+                         re.IGNORECASE)
+
+
+def _fill_shared_cols(m: pd.DataFrame) -> pd.DataFrame:
+    """3.5.6: after an outer join of two signals, fill the signal-independent
+    columns (geometry, time, station) of the _f1 side from the _f2 side, so an
+    epoch with only the second signal still has satellite position, elevation
+    and UTC under the _f1 names. Signal columns (Doppler, C/N0, ...) stay NaN."""
+    for c in list(m.columns):
+        if not c.endswith('_f1'):
+            continue
+        base = c[:-3]
+        c2 = base + '_f2'
+        if c2 in m.columns and not _SIGNAL_COL.search(base):
+            m[c] = m[c].where(m[c].notna(), m[c2])
+    return m
+
+
 def bin_by_impact(a: np.ndarray, alpha: np.ndarray,
                   bin_m: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Average alpha in bins of impact parameter. Returns (a_mean, alpha_mean, count), a ascending."""
@@ -3077,29 +3207,72 @@ def bin_by_impact(a: np.ndarray, alpha: np.ndarray,
 
 def iono_free_on_bins(a1, al1, a2, al2, f1, f2, bin_m, smooth_bins):
     """
-    Dual-frequency combination on common impact-parameter bins (Hajj Eq. 18):
+    Dual-frequency combination on impact-parameter bins (Hajj Eq. 18):
         alpha_neut = alpha1 + c2 * <alpha1 - alpha2>,   c2 = f2^2/(f1^2 - f2^2)
     The L1-L2 difference is smoothed over `smooth_bins` bins to limit L2 noise.
-    v4.7: bins with no L2 nearby (L2 tracking gap) fall back to L1 alone instead
-    of being dropped; the 5th return value flags them (l1_only).
-    Returns (a_bins, alpha, alpha1_bins, alpha2_on_bins, l1_only) or None.
+    3.5.6: bins come from BOTH frequencies. A bin with only one frequency uses
+    the smoothed L1-L2 difference of nearby dual bins if there is one (the
+    correction is still applied), otherwise that frequency alone (flagged).
+    Returns (a_bins, alpha, alpha1_bins, alpha2_bins, sf) or None, where
+    sf = 0 ionosphere-free, 1 L1 only, 2 L2 only.
     """
     ca1, b1, _ = bin_by_impact(a1, al1, bin_m)
-    if len(ca1) < 2:
-        return None
     ca2, b2, _ = bin_by_impact(a2, al2, bin_m)
-    if len(ca2) >= 2:
-        b2_on1 = np.interp(ca1, ca2, b2, left=np.nan, right=np.nan)
-        near = np.abs(ca2[np.clip(np.searchsorted(ca2, ca1), 0, len(ca2) - 1)] - ca1)
-        near = np.minimum(near, np.abs(ca2[np.clip(np.searchsorted(ca2, ca1) - 1, 0, len(ca2) - 1)] - ca1))
-        b2_on1 = np.where(near <= smooth_bins * bin_m, b2_on1, np.nan)   # no bridging across L2 gaps
-    else:
-        b2_on1 = np.full_like(b1, np.nan)
+    if len(ca1) + len(ca2) < 2:
+        return None
     c2 = f2 ** 2 / (f1 ** 2 - f2 ** 2)
-    diff = pd.Series(b1 - b2_on1).rolling(int(smooth_bins), center=True,
-                                          min_periods=1).mean().values
-    l1_only = ~np.isfinite(diff)
-    return ca1, np.where(l1_only, b1, b1 + c2 * diff), b1, b2_on1, l1_only
+    reach = smooth_bins * bin_m
+
+    def _near(ca_from, ca_to):
+        """distance from each ca_to to the nearest ca_from"""
+        if len(ca_from) == 0:
+            return np.full(len(ca_to), np.inf)
+        k = np.searchsorted(ca_from, ca_to)
+        d_hi = np.abs(ca_from[np.clip(k, 0, len(ca_from) - 1)] - ca_to)
+        d_lo = np.abs(ca_from[np.clip(k - 1, 0, len(ca_from) - 1)] - ca_to)
+        return np.minimum(d_hi, d_lo)
+
+    # 3.5.6: the L1-L2 difference comes ONLY from epochs that have both frequencies
+    # (alpha1 - alpha2 of the same ray), binned on the L1 impact parameter and
+    # smoothed. Bin means of L1 and L2 over different sets of epochs must not be
+    # differenced: with c2 ~ 1.5 any mismatch is amplified into the result.
+    a1 = np.asarray(a1, float); al1 = np.asarray(al1, float)
+    a2 = np.asarray(a2, float); al2 = np.asarray(al2, float)
+    pair = np.isfinite(a1) & np.isfinite(al1) & np.isfinite(al2)
+    cad, bd, _ = bin_by_impact(a1[pair], al1[pair] - al2[pair], bin_m)
+    # 3.5.6: the ionospheric L1-L2 bending difference of a ground ray is < ~0.3 mrad.
+    # A larger difference is a tracking (Doppler) error on one signal, which c2 ~ 1.5
+    # would amplify: those bins use one frequency instead (L1; L2 where L1 is missing).
+    keep_d = np.abs(bd) <= IONO_DIFF_MAX_RAD
+    cad, bd = cad[keep_d], bd[keep_d]
+    if len(cad):
+        bd = pd.Series(bd).rolling(int(smooth_bins), center=True, min_periods=1).mean().values
+
+    def _diff_at(ca):
+        if len(cad) == 0 or len(ca) == 0:
+            return np.full(len(ca), np.nan)
+        d = np.interp(ca, cad, bd) if len(cad) >= 2 else np.full(len(ca), bd[0])
+        return np.where(_near(cad, ca) <= reach / 2.0, d, np.nan)    # no extrapolation far from dual data
+
+    diff = _diff_at(ca1)
+    b2_on1 = (np.where(_near(ca2, ca1) <= reach, np.interp(ca1, ca2, b2, left=np.nan, right=np.nan), np.nan)
+              if len(ca1) and len(ca2) >= 2 else np.full(len(ca1), np.nan))
+    sf1 = np.where(np.isfinite(diff), 0, 1)
+    alpha_1 = np.where(sf1 == 0, b1 + c2 * diff, b1)
+
+    # L2 bins with no L1 bin nearby (L1 tracking gap): add them
+    own2 = _near(ca1, ca2) > 0.5 * bin_m if len(ca2) else np.zeros(0, bool)
+    ca2x, b2x = ca2[own2], b2[own2]
+    d_on2 = _diff_at(ca2x)
+    sf2 = np.where(np.isfinite(d_on2), 0, 2)
+    alpha_2 = np.where(sf2 == 0, b2x + (1.0 + c2) * d_on2, b2x)   # alpha1 = alpha2 + diff
+
+    ca = np.concatenate([ca1, ca2x])
+    o = np.argsort(ca)
+    return (ca[o], np.concatenate([alpha_1, alpha_2])[o],
+            np.concatenate([b1, np.full(len(ca2x), np.nan)])[o],
+            np.concatenate([b2_on1, b2x])[o],
+            np.concatenate([sf1, sf2]).astype(int)[o])
 
 
 def refractivity_table_above_station(N_r: float, h_tab_m: Optional[np.ndarray] = None,
@@ -3291,11 +3464,28 @@ class BendingAngleRetriever:
             mode = None
             if gnss_id in FREQ_PAIRS:
                 s1, s2 = FREQ_PAIRS[gnss_id]
-                merged_all = _sig(s1).join(_sig(s2), lsuffix='_f1', rsuffix='_f2', how='inner')
-                merged_all = merged_all[merged_all[f'{elev_col}_f1'] < RO_ELEVATION_THRESHOLD]
-                if len(merged_all) >= config.min_epochs_for_bending:
-                    mode = 'dual'
-            if mode is None and ALLOW_SINGLE_FREQ and gnss_id in SINGLE_FREQ_SIGNALS:
+                d_1, d_2 = _sig(s1), _sig(s2)
+                n_1 = int((d_1[elev_col] < RO_ELEVATION_THRESHOLD).sum()) if len(d_1) else 0
+                n_2 = int((d_2[elev_col] < RO_ELEVATION_THRESHOLD).sum()) if len(d_2) else 0
+                if n_1 >= 3 and n_2 >= 3:
+                    # 3.5.6: per-epoch frequency fallback. Every epoch with either signal is
+                    # kept (outer join); both -> iono-free, one -> that signal alone.
+                    merged_all = d_1.join(d_2, lsuffix='_f1', rsuffix='_f2',
+                                          how='outer' if ALLOW_SINGLE_FREQ else 'inner')
+                    merged_all = _fill_shared_cols(merged_all)
+                    merged_all = merged_all[merged_all[f'{elev_col}_f1'] < RO_ELEVATION_THRESHOLD]
+                    if len(merged_all) >= config.min_epochs_for_bending:
+                        mode = 'dual'
+                elif ALLOW_SINGLE_FREQ and max(n_1, n_2) >= config.min_epochs_for_bending:
+                    # only one signal of the pair recorded: single frequency on whichever it is
+                    s1 = s2 = s1 if n_1 >= n_2 else s2
+                    d1 = _sig(s1)
+                    merged_all = d1.join(d1, lsuffix='_f1', rsuffix='_f2', how='inner')
+                    merged_all = merged_all[merged_all[f'{elev_col}_f1'] < RO_ELEVATION_THRESHOLD]
+                    if len(merged_all) >= config.min_epochs_for_bending:
+                        mode = 'single'
+            if mode is None and ALLOW_SINGLE_FREQ and gnss_id in SINGLE_FREQ_SIGNALS \
+                    and gnss_id not in FREQ_PAIRS:
                 # v4.3: single frequency - the signal is joined with itself so the
                 # rest of the step is unchanged; only the iono combination is skipped.
                 s1 = s2 = SINGLE_FREQ_SIGNALS[gnss_id]
@@ -3327,18 +3517,28 @@ class BendingAngleRetriever:
                     return ProcessingResult(False, message="Cancelled")
 
             if len(merged) < config.min_epochs_for_bending:
-                skipped[sat_id] = 'too few low-elevation dual-frequency epochs'
+                skipped[sat_id] = 'too few low-elevation epochs'
                 _ck(sat_id, 'Epochs in this occultation', False, f'{len(merged)}', f'≥ {config.min_epochs_for_bending}')
                 continue
-            _ck(sat_id, 'Epochs in this occultation', True,
-                f"{len(merged)} ({'dual' if freq_mode == 'dual' else 'SINGLE'}-frequency)",
-                f'≥ {config.min_epochs_for_bending}')
+            if freq_mode == 'dual':
+                _h1 = merged['atmos_doppler_f1'].notna().values if 'atmos_doppler_f1' in merged else np.ones(len(merged), bool)
+                _h2 = merged['atmos_doppler_f2'].notna().values if 'atmos_doppler_f2' in merged else np.ones(len(merged), bool)
+                _nb, _n1, _n2 = int((_h1 & _h2).sum()), int((_h1 & ~_h2).sum()), int((~_h1 & _h2).sum())
+                _ep_txt = f"{len(merged)} ({_nb} both" + (f", {_n1} {s1} only" if _n1 else '') \
+                          + (f", {_n2} {s2} only" if _n2 else '') + ')'
+            else:
+                _ep_txt = f"{len(merged)} (SINGLE-frequency, {s1})"
+            _ck(sat_id, 'Epochs in this occultation', True, _ep_txt, f'≥ {config.min_epochs_for_bending}')
 
             f1 = get_signal_frequency(s1, gnss_id)
             f2 = get_signal_frequency(s2, gnss_id)
             if 'carrier_freq_hz_f1' in merged.columns:      # v4.1: true carrier (GLONASS FDMA)
-                f1 = float(pd.to_numeric(merged['carrier_freq_hz_f1'], errors='coerce').median()) or f1
-                f2 = float(pd.to_numeric(merged['carrier_freq_hz_f2'], errors='coerce').median()) or f2
+                _m1 = float(pd.to_numeric(merged['carrier_freq_hz_f1'], errors='coerce').median())
+                _m2 = float(pd.to_numeric(merged['carrier_freq_hz_f2'], errors='coerce').median())
+                f1 = _m1 if np.isfinite(_m1) and _m1 > 0 else f1
+                f2 = _m2 if np.isfinite(_m2) and _m2 > 0 else f2
+            # 3.5.6: which band a single-frequency result is on (L1 or L2 of the pair)
+            sf_band = ('L2' if gnss_id in FREQ_PAIRS and s1 == FREQ_PAIRS[gnss_id][1] else 'L1')
             lam1, lam2 = self.c / f1, self.c / f2
 
             r_sat = merged[['interp_x_f1', 'interp_y_f1', 'interp_z_f1']].values.astype(float)
@@ -3371,19 +3571,22 @@ class BendingAngleRetriever:
             d1 = merged['atmos_dopp_poli_f1'].fillna(merged['atmos_doppler_f1']).values.astype(float)
             d2 = merged['atmos_dopp_poli_f2'].fillna(merged['atmos_doppler_f2']).values.astype(float)
 
-            n_ep = len(merged)
-            G1 = np.full((n_ep, 4), np.nan)
-            G2 = np.full((n_ep, 4), np.nan)
-            for i in range(n_ep):
-                r_t = r_sat[i] - c0
-                g = bending_geometry(d1[i], lam1, r_t, v_sat[i], r_r, n_r)
-                if g is not None:
-                    G1[i] = g
-                g = bending_geometry(d2[i], lam2, r_t, v_sat[i], r_r, n_r)
-                if g is not None:
-                    G2[i] = g
+            # 3.5.6: vectorised geometry + horizon calibration of the Doppler (per frequency)
+            r_t_all = r_sat - c0
+            t_ep = merged.index.values.astype(float)
+            calib = {}
+            G1, cal1 = horizon_calibrated_geometry(d1, lam1, r_t_all, v_sat, r_r, n_r, t_ep)
+            G2, cal2 = horizon_calibrated_geometry(d2, lam2, r_t_all, v_sat, r_r, n_r, t_ep)
+            for nm, cv in (((s1, cal1), (s2, cal2)) if freq_mode == 'dual' else ((s1, cal1),)):
+                if cv:
+                    calib[nm] = cv
+            if calib:
+                _ck(sat_id, 'Horizon calibration (Doppler offset)', None,
+                    ', '.join(f"{k} {v['offset_hz']:+.3f} Hz (impact parameter {v['excess_m']:.0f} m above n_r r_r)"
+                              for k, v in calib.items()),
+                    'peak impact parameter ≤ n_r r_r')
 
-            ok = np.isfinite(G1[:, 1])          # v4.7: L2 may be missing (L1 fallback per bin)
+            ok = np.isfinite(G1[:, 1]) | np.isfinite(G2[:, 1])   # 3.5.6: either frequency is enough
             if ok.sum() < config.min_epochs_for_bending:
                 skipped[sat_id] = 'geometry solve failed on most epochs'
                 _ck(sat_id, 'Ray geometry solved', False, f'{int(ok.sum())}/{len(ok)} epochs',
@@ -3393,8 +3596,9 @@ class BendingAngleRetriever:
                 f'≥ {config.min_epochs_for_bending}')
             G1, G2, el_ok, utc_ok, az_ok = G1[ok], G2[ok], el[ok], utc[ok], az[ok]
 
+            a_pri = np.where(np.isfinite(G1[:, 1]), G1[:, 1], G2[:, 1])   # L1 impact, else L2
             branch, i_pk = label_branches(
-                G1[:, 1], el_ok, el_h_prior=apparent_horizon_prior_deg(n_r, float(np.linalg.norm(r_r))))
+                a_pri, el_ok, el_h_prior=apparent_horizon_prior_deg(n_r, float(np.linalg.norm(r_r))))
             alpha1 = G1[:, 0] + G1[:, 2] + branch * G1[:, 3]
             alpha2 = G2[:, 0] + G2[:, 2] + branch * G2[:, 3]
             alpha1 = np.where(branch == 0, np.nan, alpha1)     # guard band
@@ -3414,7 +3618,8 @@ class BendingAngleRetriever:
                                    f'(Doppler bias? median L1 atmos Doppler {np.nanmedian(d1):+.2f} Hz)')
                 if output_dir:
                     pd.DataFrame({'utc': utc_ok, 'elevation_deg': el_ok, 'branch': branch,
-                                  'a_L1_m': G1[:, 1], 'alpha_L1_rad': G1[:, 0] + G1[:, 2] + branch * G1[:, 3]}
+                                  'a_L1_m': G1[:, 1], 'alpha_L1_rad': G1[:, 0] + G1[:, 2] + branch * G1[:, 3],
+                                  'a_L2_m': G2[:, 1], 'alpha_L2_rad': G2[:, 0] + G2[:, 2] + branch * G2[:, 3]}
                                  ).to_csv(f"{output_dir}/{sat_id}_epochs.csv", index=False)
                 continue
 
@@ -3423,6 +3628,8 @@ class BendingAngleRetriever:
                     'utc': utc_ok, 'elevation_deg': el_ok, 'azimuth_deg': az_ok,
                     'branch': branch, 'a_L1_m': G1[:, 1], 'a_L2_m': G2[:, 1],
                     'dt_L1_rad': G1[:, 0], 'dr_L1_rad': alpha1 - G1[:, 0],
+                    'frequencies': np.where(np.isfinite(alpha1) & np.isfinite(alpha2), 'both',
+                                            np.where(np.isfinite(alpha1), 'L1', np.where(np.isfinite(alpha2), 'L2', ''))),
                     'alpha_L1_rad': alpha1, 'alpha_L2_rad': alpha2,
                 }).to_csv(f"{output_dir}/{sat_id}_epochs.csv", index=False)
 
@@ -3433,14 +3640,15 @@ class BendingAngleRetriever:
                     res[b] = None
                 elif freq_mode == 'single':
                     ca, cb, _ = bin_by_impact(G1[m, 1], alpha1[m], A_BIN_M)
-                    res[b] = (ca, cb, cb, np.full_like(cb, np.nan), np.ones(len(cb), bool)) if len(ca) >= 2 else None
+                    res[b] = (ca, cb, cb, np.full_like(cb, np.nan), np.ones(len(cb), int)) if len(ca) >= 2 else None
                 else:
                     res[b] = iono_free_on_bins(G1[m, 1], alpha1[m], G2[m, 1], alpha2[m],
                                                f1, f2, A_BIN_M, IONO_SMOOTH_BINS)
                 if res[b] is not None and np.isfinite(res[b][1]).sum() < 2:
                     res[b] = None
-            nN = int(np.sum((branch == -1) & np.isfinite(alpha1)))       # usable epochs per side
-            nP = int(np.sum((branch == 1) & np.isfinite(alpha1)))
+            _any = np.isfinite(alpha1) | np.isfinite(alpha2)
+            nN = int(np.sum((branch == -1) & _any))       # usable epochs per side (either frequency)
+            nP = int(np.sum((branch == 1) & _any))
             _eN, _eP = el_ok[branch == -1], el_ok[branch == 1]
             el_hor = (0.5 * (np.nanmax(_eN) + np.nanmin(_eP)) if len(_eN) and len(_eP)
                       else apparent_horizon_prior_deg(n_r, float(np.linalg.norm(r_r))))   # v4.7: estimate when one-sided
@@ -3454,12 +3662,12 @@ class BendingAngleRetriever:
                     '≥ 3 below' + ('' if use_model else ' and ≥ 3 above'))
                 continue
 
-            aN, alN, alN_L1, alN_L2, l1N = res[-1]
+            aN, alN, alN_L1, alN_L2, sfN = res[-1]
             # alpha_P: measured (above-horizon rays) and/or model atmosphere (v4.7)
             alP_meas = np.full_like(aN, np.nan)
             alP_L1m = np.full_like(aN, np.nan)
             alP_L2m = np.full_like(aN, np.nan)
-            l1P = np.zeros(len(aN), bool)
+            ifP = np.zeros(len(aN), bool)          # measured alpha_P is ionosphere-free
             if res[1] is not None:
                 aP = res[1][0]
                 def _on_N(v):
@@ -3467,7 +3675,7 @@ class BendingAngleRetriever:
                     return (np.interp(aN, aP[okc], v[okc], left=np.nan, right=np.nan) if okc.sum() >= 2
                             else np.full_like(aN, np.nan))
                 alP_meas, alP_L1m, alP_L2m = _on_N(res[1][1]), _on_N(res[1][2]), _on_N(res[1][3])
-                l1P = _on_N(res[1][4].astype(float)) > 0.5
+                ifP = _on_N((res[1][4] == 0).astype(float)) > 0.5
             alP_mod = np.full_like(aN, np.nan)
             nprof_src = ''
             if use_model:
@@ -3506,17 +3714,24 @@ class BendingAngleRetriever:
             partial_L1 = alN_L1 - np.where(p_model, alP_mod, alP_L1m)
             partial_L2 = alN_L2 - np.where(p_model, alP_mod, alP_L2m)
             # 3.5.2 audit: the ionospheric bending is common to the N and P rays, so
-            # alpha_N(L1) - alpha_P(L1) cancels it (Healy et al. 2002). Never mix an
-            # L1-only side with an ionosphere-free side; a model alpha_P has no ionosphere.
+            # alpha_N(Lx) - alpha_P(Lx) cancels it (Healy et al. 2002). Never mix a
+            # single-frequency side with an ionosphere-free side; a model alpha_P has no ionosphere.
+            # 3.5.6: per level, whichever frequencies exist: both sides iono-free ->
+            # iono-free; else a frequency common to both sides (L1, else L2) -> that
+            # difference; else not cancelled.
             if freq_mode == 'dual':
-                mixed = (l1N ^ l1P) & ~p_model & np.isfinite(partial_L1)
-                partial = np.where(mixed, partial_L1, partial)
-                l1_side = l1N | (l1P & ~p_model)
-                iono_method = np.where(~l1_side, 'iono-free',
-                                       np.where(p_model, 'not cancelled (L1 - model)', 'L1 difference'))
+                ifN = sfN == 0
+                meas = ~p_model
+                use_if = ifN & (p_model | ifP)
+                use_l1 = ~use_if & meas & np.isfinite(partial_L1)
+                use_l2 = ~use_if & ~use_l1 & meas & np.isfinite(partial_L2)
+                partial = np.where(use_l1, partial_L1, np.where(use_l2, partial_L2, partial))
+                iono_method = np.where(use_if, 'iono-free',
+                                       np.where(use_l1, 'L1 difference',
+                                                np.where(use_l2, 'L2 difference', 'not cancelled')))
             else:
-                iono_method = np.where(p_model, 'not cancelled (L1 - model)', 'L1 difference')
-            iono_ok = iono_method != 'not cancelled (L1 - model)'
+                iono_method = np.where(p_model, 'not cancelled', f'{sf_band} difference')
+            iono_ok = iono_method != 'not cancelled'
             l1_only_lv = ~iono_ok
             keep = np.isfinite(partial) & (aN < x_r)
             if keep.sum() < 3:
@@ -3525,6 +3740,16 @@ class BendingAngleRetriever:
                 continue
             _ck(sat_id, 'Below/above rays overlap', True, f'{int(keep.sum())} levels', '≥ 3 levels')
 
+            # 3.5.6: alpha' <= 0 is unphysical (refraction bends toward the Earth) also with a
+            # measured alpha_P: a tracking error on one side. Those levels are dropped.
+            bad_m = keep & ~p_model & ~(partial > 0)
+            if bad_m.any():
+                keep = keep & ~bad_m
+                _ck(sat_id, "Partial bending > 0 (measured alpha_P)", bool(keep.sum() >= 3),
+                    f"{int(bad_m.sum())} levels with alpha' <= 0 dropped", "≥ 3 levels left")
+                if keep.sum() < 3:
+                    skipped[sat_id] = "partial bending alpha' <= 0 on almost every level (Doppler / tracking error)"
+                    continue
             # v4.7: model alpha_P does not cancel a Doppler bias the way a measured alpha_P
             # does (it is common to alpha_N and alpha_P). Physical check on model levels:
             # alpha' > 0, and for an all-model event alpha' must grow with depth.
@@ -3572,11 +3797,13 @@ class BendingAngleRetriever:
                 'geoid_sep_m': st.geoid_sep_m,
                 'freq_mode': freq_mode,                     # 'dual' | 'single'
                 'iono_corrected': iono_ok[keep],              # 3.5.2: False only where the ionosphere is not cancelled
-                'iono_method': iono_method[keep],             # iono-free | L1 difference | not cancelled (L1 - model)
+                'iono_method': iono_method[keep],             # iono-free | L1 difference | L2 difference | not cancelled
                 'alpha_P_src': np.where(p_model[keep], 'model', 'measured'),
                 'alpha_P_model_rad': alP_mod[keep],
                 'alpha_P_measured_rad': alP_meas[keep],
                 'nprof_src': nprof_src,
+                'doppler_offset_L1_hz': (cal1 or {}).get('offset_hz', 0.0),   # 3.5.6 horizon calibration
+                'doppler_offset_L2_hz': (cal2 or {}).get('offset_hz', 0.0) if freq_mode == 'dual' else 0.0,
                 'sig1': s1, 'sig2': s2 if freq_mode == 'dual' else '',
             })
             h_max = (config.height_range_max if config.height_range_max > 0
@@ -4778,7 +5005,9 @@ CHECK_SHORT = {'Atmospheric Doppler (reference satellite found)': 'Atmos. Dopple
                'Below the horizon (0°)': 'Below 0°', 'Epochs in this occultation': 'Event epochs',
                'Ray geometry solved': 'Geometry', 'Bending > 0 (no Doppler bias)': 'Bending > 0',
                'Crosses the apparent horizon': 'Crosses horizon', 'Below/above rays overlap': 'Overlap',
-               'Profile levels': 'Levels', 'Bending grows with depth (QC)': 'Depth QC', "Partial bending physical (model alpha_P)": "Physical α′ (model α_P)"}
+               'Profile levels': 'Levels', 'Bending grows with depth (QC)': 'Depth QC', "Partial bending physical (model alpha_P)": "Physical α′ (model α_P)",
+               "Partial bending > 0 (measured alpha_P)": "α′ > 0",
+               'Horizon calibration (Doppler offset)': 'Horizon calib.'}
 CHECK_COLOR = {True: '#1a8a4a', False: '#c62828', None: '#e07b00', 'not_reached': '#a8a7a2'}
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GNSS Radio Occultation Processing GUI  3.5.5
+GNSS Radio Occultation Processing GUI  3.5.6
 ==============================================
 
 Supports both ground-based and satellite-based (LEO) GNSS-RO processing.
@@ -21,7 +21,7 @@ for _s in (sys.stdout, sys.stderr):   # Windows cp1252 consoles: never crash on 
     except Exception:
         pass
 
-__version__ = "3.5.5"
+__version__ = "3.5.6"
 import re
 import json
 import glob
@@ -72,8 +72,9 @@ from ground_gnss_ro_pipeline import (
     retrieve_refractivity, compare_with_era5, retrieve_atmospheric_profile,
     PROCESSING_DEFAULTS, load_processing_config_from_cra, apply_processing_config,
     extract_station_info,
-    session_quality, session_quality_lines, load_ro_checks, SHOW_RO_CHECKS,
+    session_quality, session_quality_lines, load_ro_checks,
 )
+import ground_gnss_ro_pipeline as _gp      # live settings (e.g. SHOW_RO_CHECKS after apply_processing_config)
 
 from sat_gnss_ro_pipeline import (
     LEOROPipeline, PipelineConfig as SatPipelineConfig
@@ -855,8 +856,7 @@ def run_ground_pipeline(station_dict: dict, ubx_dir: str, sp3_file: str,
         except Exception:
             status_, reasons_ = {}, {}
         bdir = os.path.join(output_dir, 'bending')
-        from ground_gnss_ro_pipeline import SHOW_RO_CHECKS
-        for item, state in (status_.items() if SHOW_RO_CHECKS else ()):
+        for item, state in (status_.items() if _gp.SHOW_RO_CHECKS else ()):
             if _norm_ground_state(state) in ('ro_empty', 'no_ro'):
                 generate_ro_checklist_plot(item, load_ro_checks(bdir, item),
                                            os.path.join(plots_dir, f'{item}_derived.png'), reasons_.get(item, ''))
@@ -1317,7 +1317,9 @@ class ProcessingPanel(QGroupBox):
         ('EVENT_GAP_S',                 'Event gap (s)',             'float', 1.0,   86400.0, 1,    "A gap longer than this splits a satellite into separate occultation events."),
         ('MAX_NC_DISTANCE_KM',          'Max .nc distance (km)',     'float', 1.0,   5000.0,  0,    "A .nc column is used only within this distance of the tangent point (or station):\nthe nearest grid point of a gridded file (e.g. ERA5), or a single radiosonde profile."),
         ('ALPHA_P_MODEL',               'Model α_P if not measured', 'apmodel', None, None,   None, "Satellites that stay below the apparent horizon (no above-horizon ray) and levels whose\nabove-horizon ray was not tracked get alpha_P from a model atmosphere (.nc file if available).\nOff = such levels/satellites are dropped.\n(.cra value 'always' = use the model for every level.)"),
-        ('ALLOW_SINGLE_FREQ',           'Allow single-frequency',    'bool',  None,  None,    None, "Use L1-only events when dual-frequency data is missing.\nNO ionospheric correction (~1–2% in N). Results are flagged ◐ [RO·1F] in amber."),
+        ('ALLOW_SINGLE_FREQ',           'Allow single-frequency',    'bool',  None,  None,    None, "Use one frequency (L1 or L2) wherever the other is missing, per epoch.\nBoth present: ionosphere-free. One present: that frequency alone, the ionosphere\nis cancelled only if the above-horizon ray has the same frequency (else hollow points).\nOff = only epochs with both frequencies."),
+        ('HORIZON_CALIBRATION',         'Horizon calibration',       'bool',  None,  None,    None, "If the impact parameter peaks ABOVE n_r·r_r (impossible for any real ray), a constant\nDoppler offset is removed so the peak sits at n_r·r_r. Without it the rays below\nthe horizon cannot be solved. The offset is shown in the RO checklist."),
+        ('SHOW_RO_CHECKS',              'Show RO checklist',         'bool',  None,  None,    None, "Panel 2: the RO test checklist (pass / fail and values),\nalso for satellites without a profile. Applies from the next run."),
         ('REF_SAT_ELEVATION_THRESHOLD', 'Ref-sat elev thresh (°)',   'float', 0.0,   90.0,    1,    "Reference satellites must stay above this elevation; epochs without one are dropped."),
         ('REF_SAT_MIN_EPOCHS',          'Ref-sat min epochs',        'int',   1,     100000,  1,    "Minimum coverage for the primary reference satellite."),
         ('REF_SAT_JUMP_THRESHOLD',      'Ref-sat jump thresh (Hz)',  'float', 0.0,   100.0,   2,    "Excess-Doppler jump counted as a cycle slip when scoring references."),
@@ -2614,7 +2616,7 @@ class MainWindow(QMainWindow):
                 if is_success:
                     derived_path = os.path.join(plots_dir, f'{item_id}_derived.png')
                     self.derived_canvas.load_from_png(derived_path)
-                elif SHOW_RO_CHECKS and os.path.exists(os.path.join(plots_dir, f'{item_id}_derived.png')):
+                elif _gp.SHOW_RO_CHECKS and os.path.exists(os.path.join(plots_dir, f'{item_id}_derived.png')):
                     # v4.6: page with every RO test, pass / fail, values
                     self.derived_canvas.load_from_png(os.path.join(plots_dir, f'{item_id}_derived.png'))
                 elif ro_state == 'ro_empty':
